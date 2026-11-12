@@ -1,0 +1,217 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Public user profile for Q Social Network members",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "User UID matching auth.uid" },
+        "displayName": { "type": "string", "maxLength": 100, "description": "User's display name" },
+        "handle": { "type": "string", "maxLength": 50, "description": "Unique username handle" },
+        "photoURL": { "type": "string", "maxLength": 1000, "description": "Avatar photo URL" },
+        "bannerURL": { "type": "string", "maxLength": 1000, "description": "Profile header banner image URL" },
+        "bio": { "type": "string", "maxLength": 500, "description": "User biography" },
+        "role": { "type": "string", "enum": ["user", "admin", "owner"], "description": "Role of the user" },
+        "isOnline": { "type": "boolean", "description": "Current active presence status" },
+        "lastActiveAt": { "type": "string", "description": "ISO timestamp of last activity" },
+        "followersCount": { "type": "number", "description": "Count of followers" },
+        "followingCount": { "type": "number", "description": "Count of following users" },
+        "postsCount": { "type": "number", "description": "Total posts created" },
+        "createdAt": { "type": "string", "description": "Account creation timestamp" }
+      },
+      "required": ["id", "displayName", "handle", "role", "createdAt"]
+    },
+    "UserPrivate": {
+      "title": "UserPrivate",
+      "description": "Private user information isolated from public read",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "maxLength": 200, "description": "User email address" },
+        "role": { "type": "string", "enum": ["user", "admin", "owner"], "description": "Assigned role" },
+        "createdAt": { "type": "string", "description": "Registration timestamp" }
+      },
+      "required": ["email", "role", "createdAt"]
+    },
+    "Post": {
+      "title": "Post",
+      "description": "Social feed post shared by a member",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Post ID" },
+        "authorId": { "type": "string", "description": "UID of post author" },
+        "authorName": { "type": "string", "maxLength": 100, "description": "Name of post author" },
+        "authorHandle": { "type": "string", "maxLength": 50, "description": "Handle of post author" },
+        "authorPhotoURL": { "type": "string", "maxLength": 1000, "description": "Photo URL of post author" },
+        "content": { "type": "string", "maxLength": 2000, "description": "Text content of the post" },
+        "mediaURL": { "type": "string", "maxLength": 1000, "description": "Attached media URL" },
+        "likesCount": { "type": "number", "description": "Total like count" },
+        "commentsCount": { "type": "number", "description": "Total comments count" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" }
+      },
+      "required": ["id", "authorId", "authorName", "content", "createdAt"]
+    },
+    "Comment": {
+      "title": "Comment",
+      "description": "Comment on a post",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Comment ID" },
+        "postId": { "type": "string", "description": "Target post ID" },
+        "authorId": { "type": "string", "description": "UID of commenter" },
+        "authorName": { "type": "string", "maxLength": 100, "description": "Name of commenter" },
+        "authorHandle": { "type": "string", "maxLength": 50, "description": "Handle of commenter" },
+        "authorPhotoURL": { "type": "string", "maxLength": 1000, "description": "Photo URL of commenter" },
+        "text": { "type": "string", "maxLength": 1000, "description": "Comment text" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" }
+      },
+      "required": ["id", "postId", "authorId", "authorName", "text", "createdAt"]
+    },
+    "Like": {
+      "title": "Like",
+      "description": "Record of a post like by a user",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Liking user UID" },
+        "postId": { "type": "string", "description": "Liked post ID" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" }
+      },
+      "required": ["userId", "postId", "createdAt"]
+    },
+    "Follow": {
+      "title": "Follow",
+      "description": "Follow relationship between two users",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Relationship ID followerId_followingId" },
+        "followerId": { "type": "string", "description": "UID of the user following" },
+        "followingId": { "type": "string", "description": "UID of the user being followed" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" }
+      },
+      "required": ["id", "followerId", "followingId", "createdAt"]
+    },
+    "Conversation": {
+      "title": "Conversation",
+      "description": "Direct message thread between users",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Conversation ID" },
+        "participantIds": { "type": "array", "description": "Array of participant UIDs" },
+        "lastMessageText": { "type": "string", "maxLength": 500, "description": "Snippet of last message" },
+        "lastMessageSenderId": { "type": "string", "description": "Sender UID of last message" },
+        "lastMessageTimestamp": { "type": "string", "description": "Timestamp of last message" },
+        "updatedAt": { "type": "string", "description": "Last updated timestamp" },
+        "createdAt": { "type": "string", "description": "Thread creation timestamp" }
+      },
+      "required": ["id", "participantIds", "createdAt"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "Individual message in a conversation",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Message ID" },
+        "conversationId": { "type": "string", "description": "Parent conversation ID" },
+        "senderId": { "type": "string", "description": "Sender UID" },
+        "senderName": { "type": "string", "maxLength": 100, "description": "Sender display name" },
+        "text": { "type": "string", "maxLength": 2000, "description": "Message text" },
+        "mediaURL": { "type": "string", "maxLength": 1000, "description": "Optional attached media URL" },
+        "createdAt": { "type": "string", "description": "Message timestamp" }
+      },
+      "required": ["id", "conversationId", "senderId", "text", "createdAt"]
+    },
+    "Story": {
+      "title": "Story",
+      "description": "Ephemeral 24-hour visual story",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Story ID" },
+        "authorId": { "type": "string", "description": "Author UID" },
+        "authorName": { "type": "string", "maxLength": 100, "description": "Author display name" },
+        "authorPhotoURL": { "type": "string", "maxLength": 1000, "description": "Author photo URL" },
+        "mediaURL": { "type": "string", "maxLength": 1000, "description": "Image or media URL" },
+        "caption": { "type": "string", "maxLength": 200, "description": "Optional story caption" },
+        "viewers": { "type": "array", "description": "Array of viewer UIDs" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" },
+        "expiresAt": { "type": "string", "description": "Expiration timestamp (24h after creation)" }
+      },
+      "required": ["id", "authorId", "authorName", "mediaURL", "createdAt", "expiresAt"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "Real-time user notification",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Notification ID" },
+        "recipientId": { "type": "string", "description": "Target recipient UID" },
+        "senderId": { "type": "string", "description": "Actor UID" },
+        "senderName": { "type": "string", "maxLength": 100, "description": "Actor display name" },
+        "senderPhotoURL": { "type": "string", "maxLength": 1000, "description": "Actor photo URL" },
+        "type": { "type": "string", "enum": ["like", "comment", "follow", "message"], "description": "Event type" },
+        "targetId": { "type": "string", "maxLength": 128, "description": "Target entity ID (postId, etc)" },
+        "message": { "type": "string", "maxLength": 300, "description": "Notification copy" },
+        "read": { "type": "boolean", "description": "Read status" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" }
+      },
+      "required": ["id", "recipientId", "senderId", "senderName", "type", "message", "read", "createdAt"]
+    },
+    "Presence": {
+      "title": "Presence",
+      "description": "Real active heartbeat and online presence for user",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "User UID" },
+        "displayName": { "type": "string", "maxLength": 100, "description": "User display name" },
+        "photoURL": { "type": "string", "maxLength": 1000, "description": "User photo URL" },
+        "isOnline": { "type": "boolean", "description": "Online flag" },
+        "lastSeen": { "type": "string", "description": "ISO timestamp of last heartbeat" }
+      },
+      "required": ["userId", "isOnline", "lastSeen"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "Public profile documents"
+    },
+    "/users/{userId}/private/{infoId}": {
+      "schema": { "$ref": "#/entities/UserPrivate" },
+      "description": "Private user information isolated to owner and admins"
+    },
+    "/posts/{postId}": {
+      "schema": { "$ref": "#/entities/Post" },
+      "description": "Published feed posts"
+    },
+    "/posts/{postId}/comments/{commentId}": {
+      "schema": { "$ref": "#/entities/Comment" },
+      "description": "Comments on a post"
+    },
+    "/posts/{postId}/likes/{userId}": {
+      "schema": { "$ref": "#/entities/Like" },
+      "description": "Likes on a post"
+    },
+    "/follows/{followId}": {
+      "schema": { "$ref": "#/entities/Follow" },
+      "description": "Follow relationship records"
+    },
+    "/conversations/{conversationId}": {
+      "schema": { "$ref": "#/entities/Conversation" },
+      "description": "Direct message chat channels"
+    },
+    "/conversations/{conversationId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/Message" },
+      "description": "Messages inside conversation"
+    },
+    "/stories/{storyId}": {
+      "schema": { "$ref": "#/entities/Story" },
+      "description": "Active 24h stories"
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/Notification" },
+      "description": "Real notifications delivered to users"
+    },
+    "/presence/{userId}": {
+      "schema": { "$ref": "#/entities/Presence" },
+      "description": "Real user presence heartbeats"
+    }
+  }
+}

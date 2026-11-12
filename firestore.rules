@@ -1,0 +1,261 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Default Deny All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function getUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         getUserRole() in ['admin', 'owner'])
+      );
+    }
+
+    function isModerator() {
+      return isSignedIn() && (
+        isAdmin() ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         getUserRole() in ['moderator', 'admin', 'owner'])
+      );
+    }
+
+    // User Public Profile
+    match /users/{userId} {
+      // Public directory allows visitors to view member profiles
+      allow get, list: if true;
+      allow create: if isSignedIn() && isValidId(userId) && request.auth.uid == userId
+        && incoming().id == userId
+        && (incoming().role == 'user' || (isAdmin() && incoming().role in ['user', 'moderator', 'admin', 'owner']))
+        && incoming().displayName is string && incoming().displayName.size() <= 100
+        && incoming().handle is string && incoming().handle.size() <= 50;
+      allow update: if isSignedIn() && isValidId(userId) && (
+        isAdmin() ||
+        (
+          request.auth.uid == userId &&
+          !incoming().diff(existing()).affectedKeys().hasAny(['role', 'id', 'createdAt', 'isVerified', 'verificationCategory', 'isSuspended', 'isBanned', 'warningCount'])
+        ) ||
+        // Allow updating counters during social interactions
+        incoming().diff(existing()).affectedKeys().hasOnly(['followersCount', 'followingCount', 'postsCount'])
+      );
+      // Owner can delete their own account or admin
+      allow delete: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+
+      // Isolated PII Subcollection
+      match /private/{docId} {
+        allow read, write: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      }
+
+      // User Bookmarked Posts
+      match /bookmarks/{postId} {
+        allow read, write: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      }
+    }
+
+    // Admins collection for role lookup
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Posts Collection (Public Feed)
+    match /posts/{postId} {
+      allow get, list: if true;
+      // Must be authenticated and authorId must strictly match request.auth.uid
+      allow create: if isSignedIn() && isValidId(postId)
+        && incoming().authorId == request.auth.uid
+        && incoming().content is string && incoming().content.size() <= 2000;
+      allow update: if isValidId(postId) && isSignedIn() && (
+        isAdmin() ||
+        (existing().authorId == request.auth.uid &&
+         !incoming().diff(existing()).affectedKeys().hasAny(['id', 'authorId', 'createdAt'])) ||
+        // Social reactions counter update
+        incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'commentsCount', 'sharesCount', 'bookmarksCount'])
+      );
+      // STRICT: Only the post author or verified administrator can delete the post
+      allow delete: if isValidId(postId) && isSignedIn() && (
+        isAdmin() || existing().authorId == request.auth.uid
+      );
+
+      // Comments Subcollection
+      match /comments/{commentId} {
+        allow get, list: if true;
+        allow create: if isSignedIn() && isValidId(commentId)
+          && incoming().authorId == request.auth.uid
+          && incoming().text is string && incoming().text.size() <= 1000;
+        allow update: if isSignedIn() && isValidId(commentId) && (
+          existing().authorId == request.auth.uid || isAdmin()
+        );
+        allow delete: if isSignedIn() && isValidId(commentId) && (
+          existing().authorId == request.auth.uid ||
+          get(/databases/$(database)/documents/posts/$(postId)).data.authorId == request.auth.uid ||
+          isAdmin()
+        );
+      }
+
+      // Likes Subcollection (Identity-locked: only owner can like/unlike under their own UID)
+      match /likes/{userId} {
+        allow get, list: if true;
+        allow create, delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      }
+    }
+
+    // Follows Collection
+    match /follows/{followId} {
+      allow get, list: if true;
+      allow create: if isSignedIn() && isValidId(followId) && incoming().followerId == request.auth.uid;
+      allow delete: if isSignedIn() && isValidId(followId) && (
+        existing().followerId == request.auth.uid || isAdmin()
+      );
+    }
+
+    // Direct Messaging Conversations (Strictly Private to Participants)
+    match /conversations/{conversationId} {
+      allow get: if isSignedIn() && isValidId(conversationId) && (
+        (request.auth.uid in resource.data.participantIds) || isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        (request.auth.uid in resource.data.participantIds) || isAdmin()
+      );
+      allow create: if isSignedIn() && isValidId(conversationId)
+        && (request.auth.uid in incoming().participantIds);
+      allow update: if isSignedIn() && isValidId(conversationId) && (
+        (request.auth.uid in existing().participantIds) || isAdmin()
+      );
+      allow delete: if isAdmin();
+
+      // Conversation Messages Subcollection
+      match /messages/{messageId} {
+        allow get: if isSignedIn() && isValidId(messageId) && (
+          (request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds) || isAdmin()
+        );
+        allow list: if isSignedIn() && (
+          (request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds) || isAdmin()
+        );
+        allow create: if isSignedIn() && isValidId(messageId)
+          && incoming().senderId == request.auth.uid
+          && (request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds);
+        allow update, delete: if isSignedIn() && isValidId(messageId) && (
+          existing().senderId == request.auth.uid || isAdmin()
+        );
+      }
+    }
+
+    // Stories Collection (Public 24h stories)
+    match /stories/{storyId} {
+      allow get, list: if true;
+      allow create: if isSignedIn() && isValidId(storyId)
+        && incoming().authorId == request.auth.uid
+        && incoming().mediaURL is string && incoming().mediaURL.size() <= 1000;
+      allow update: if isSignedIn() && isValidId(storyId) && (
+        (existing().authorId == request.auth.uid) ||
+        // Allowing viewer recording
+        incoming().diff(existing()).affectedKeys().hasOnly(['viewers']) ||
+        isAdmin()
+      );
+      allow delete: if isSignedIn() && isValidId(storyId) && (
+        existing().authorId == request.auth.uid || isAdmin()
+      );
+    }
+
+    // Notifications Collection (Strictly Recipient Only)
+    match /notifications/{notificationId} {
+      allow get: if isSignedIn() && isValidId(notificationId) && (
+        resource.data.recipientId == request.auth.uid || isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        resource.data.recipientId == request.auth.uid || isAdmin()
+      );
+      allow create: if isSignedIn() && isValidId(notificationId)
+        && incoming().senderId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(notificationId) && (
+        resource.data.recipientId == request.auth.uid &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['read'])
+      );
+      allow delete: if isSignedIn() && isValidId(notificationId) && (
+        resource.data.recipientId == request.auth.uid || isAdmin()
+      );
+    }
+
+    // Real Presence Heartbeat Collection
+    match /presence/{userId} {
+      allow get, list: if true;
+      allow create, update: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow delete: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+    }
+
+    // Community Events Collection
+    match /events/{eventId} {
+      allow get, list: if true;
+      allow create: if isAdmin();
+      allow update: if isValidId(eventId) && (
+        isAdmin() ||
+        (isSignedIn() && incoming().diff(existing()).affectedKeys().hasOnly(['registeredUserIds', 'participantsCount']))
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Moderation Reports Collection
+    match /reports/{reportId} {
+      allow get, list: if isAdmin();
+      allow create: if isSignedIn() && isValidId(reportId) && incoming().reporterId == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // Four-Tier Verification Requests Collection
+    match /verification_requests/{requestId} {
+      allow get: if isSignedIn() && isValidId(requestId) && (
+        resource.data.userId == request.auth.uid || isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        isAdmin() || resource.data.userId == request.auth.uid
+      );
+      allow create: if isSignedIn() && isValidId(requestId)
+        && incoming().userId == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // Administrative & Moderation Audit Logs (Immutable)
+    match /audit_logs/{logId} {
+      allow get, list: if isAdmin();
+      allow create: if isSignedIn() && isValidId(logId);
+      allow update, delete: if false;
+    }
+
+    // Moderation Appeals Collection
+    match /appeals/{appealId} {
+      allow get: if isSignedIn() && isValidId(appealId) && (
+        resource.data.userId == request.auth.uid || isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        isAdmin() || resource.data.userId == request.auth.uid
+      );
+      allow create: if isSignedIn() && isValidId(appealId)
+        && incoming().userId == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+  }
+}

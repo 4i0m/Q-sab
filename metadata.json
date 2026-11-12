@@ -1,0 +1,6 @@
+{
+  "name": "Q Social Network",
+  "description": "Exclusive, modern luxury social networking platform with real-time conversations, stories, media sharing, and presence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
