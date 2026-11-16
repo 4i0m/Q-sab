@@ -204,14 +204,12 @@ export function LegalPagesModal({ isOpen, onClose, initialPage }: LegalPagesModa
               </div>
             </div>
 
-            {/* Bottom Mosque Dusk Banner matching Screen 8 */}
-            <div className="mt-3 relative h-28 w-full overflow-hidden border-t border-[#2A2F3A]">
-              <img
-                src="https://images.unsplash.com/photo-1542838132-92c53300491e?auto=format&fit=crop&w=800&q=80"
-                alt="Q Platform Heritage"
-                className="w-full h-full object-cover"
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-[#161B26] via-transparent to-transparent" />
+            {/* Bottom Q Atmospheric Banner */}
+            <div className="mt-3 relative h-24 w-full overflow-hidden border-t border-[#2A2F3A] bg-[radial-gradient(circle_at_25%_30%,rgba(59,109,255,0.35),transparent_55%),radial-gradient(circle_at_80%_75%,rgba(96,165,250,0.22),transparent_55%),linear-gradient(135deg,#0B1224_0%,#141E38_60%,#0B0F19_100%)] flex items-center justify-center">
+              <div className="text-center">
+                <p className="text-xs font-bold text-white/90 tracking-wide">Q Social Network</p>
+                <p className="text-[10px] text-[#93C5FD] mt-0.5">Designed for authentic communities & conversations</p>
+              </div>
             </div>
           </div>
         )}

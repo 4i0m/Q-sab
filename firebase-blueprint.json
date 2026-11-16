@@ -9,14 +9,30 @@
         "displayName": { "type": "string", "maxLength": 100, "description": "User's display name" },
         "handle": { "type": "string", "maxLength": 50, "description": "Unique username handle" },
         "photoURL": { "type": "string", "maxLength": 1000, "description": "Avatar photo URL" },
+        "photoPath": { "type": "string", "maxLength": 500, "description": "Supabase Storage path for avatar" },
         "bannerURL": { "type": "string", "maxLength": 1000, "description": "Profile header banner image URL" },
+        "bannerPath": { "type": "string", "maxLength": 500, "description": "Supabase Storage path for banner" },
         "bio": { "type": "string", "maxLength": 500, "description": "User biography" },
-        "role": { "type": "string", "enum": ["user", "admin", "owner"], "description": "Role of the user" },
+        "role": { "type": "string", "enum": ["user", "moderator", "room_leader", "assistant_admin", "admin", "owner"], "description": "Role of the user" },
+        "isVerified": { "type": "boolean", "description": "Whether account is verified" },
+        "verificationCategory": { "type": "string", "enum": ["blue", "silver", "institution", "blood_red"], "description": "Verification tier" },
+        "verificationStatus": { "type": "string", "enum": ["not_verified", "pending", "verified", "rejected"], "description": "Current verification lifecycle state" },
+        "verifiedAt": { "type": "string", "description": "ISO timestamp when verification was granted" },
+        "verifiedBy": { "type": "string", "description": "UID of admin who granted verification" },
+        "verifiedByName": { "type": "string", "maxLength": 100, "description": "Display name of admin who granted verification" },
+        "isSuspended": { "type": "boolean", "description": "Account suspension state" },
+        "isBanned": { "type": "boolean", "description": "Account permanent ban state" },
+        "warningCount": { "type": "number", "description": "Number of formal warnings" },
         "isOnline": { "type": "boolean", "description": "Current active presence status" },
         "lastActiveAt": { "type": "string", "description": "ISO timestamp of last activity" },
         "followersCount": { "type": "number", "description": "Count of followers" },
         "followingCount": { "type": "number", "description": "Count of following users" },
         "postsCount": { "type": "number", "description": "Total posts created" },
+        "customTitle": { "type": "object", "description": "Primary highest-priority custom title" },
+        "customTitles": { "type": "array", "description": "All granted cosmetic titles sorted by priority" },
+        "customRoleId": { "type": "string", "description": "Assigned global custom role ID" },
+        "customRoleName": { "type": "string", "description": "Assigned global custom role display name" },
+        "globalPermissions": { "type": "object", "description": "Granular global permissions map" },
         "createdAt": { "type": "string", "description": "Account creation timestamp" }
       },
       "required": ["id", "displayName", "handle", "role", "createdAt"]
@@ -27,10 +43,24 @@
       "type": "object",
       "properties": {
         "email": { "type": "string", "maxLength": 200, "description": "User email address" },
-        "role": { "type": "string", "enum": ["user", "admin", "owner"], "description": "Assigned role" },
+        "role": { "type": "string", "enum": ["user", "moderator", "admin", "owner"], "description": "Assigned role" },
         "createdAt": { "type": "string", "description": "Registration timestamp" }
       },
       "required": ["email", "role", "createdAt"]
+    },
+    "AdminNote": {
+      "title": "AdminNote",
+      "description": "Private administrative verification notes restricted strictly to administrators",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Target user UID" },
+        "note": { "type": "string", "maxLength": 1000, "description": "Private internal admin note" },
+        "status": { "type": "string", "enum": ["not_verified", "pending", "verified", "rejected"], "description": "Verification decision status" },
+        "updatedBy": { "type": "string", "description": "Admin UID" },
+        "updatedByName": { "type": "string", "maxLength": 100, "description": "Admin display name" },
+        "updatedAt": { "type": "string", "description": "ISO timestamp" }
+      },
+      "required": ["userId", "note", "updatedBy", "updatedAt"]
     },
     "Post": {
       "title": "Post",
@@ -42,10 +72,24 @@
         "authorName": { "type": "string", "maxLength": 100, "description": "Name of post author" },
         "authorHandle": { "type": "string", "maxLength": 50, "description": "Handle of post author" },
         "authorPhotoURL": { "type": "string", "maxLength": 1000, "description": "Photo URL of post author" },
-        "content": { "type": "string", "maxLength": 2000, "description": "Text content of the post" },
-        "mediaURL": { "type": "string", "maxLength": 1000, "description": "Attached media URL" },
+        "postType": { "type": "string", "enum": ["post", "blog", "wiki", "question", "poll", "quiz"], "description": "Content format of global post" },
+        "title": { "type": "string", "maxLength": 200, "description": "Optional post headline" },
+        "content": { "type": "string", "maxLength": 10000, "description": "Text content of the post" },
+        "mediaURL": { "type": "string", "maxLength": 1000, "description": "Attached primary media URL" },
+        "mediaURLs": { "type": "array", "description": "Up to 4 attached image URLs" },
+        "videoURL": { "type": "string", "maxLength": 1000, "description": "Attached video URL" },
+        "mediaMetadata": { "type": "array", "description": "Supabase Storage object metadata records" },
+        "storageProvider": { "type": "string", "enum": ["supabase"], "description": "Media storage backend" },
+        "tags": { "type": "array", "description": "Topic and hashtag strings" },
+        "poll": { "type": "object", "description": "Optional interactive poll definition" },
+        "quiz": { "type": "object", "description": "Optional interactive quiz definition" },
+        "bestAnswerCommentId": { "type": "string", "description": "Highlighted answer comment ID for questions" },
         "likesCount": { "type": "number", "description": "Total like count" },
         "commentsCount": { "type": "number", "description": "Total comments count" },
+        "visibility": { "type": "string", "enum": ["public", "followers_only"], "description": "Post visibility scope" },
+        "editedAt": { "type": "string", "description": "Timestamp of last edit" },
+        "editedBy": { "type": "string", "description": "UID of editor" },
+        "editedByName": { "type": "string", "description": "Display name of editor" },
         "createdAt": { "type": "string", "description": "Creation timestamp" }
       },
       "required": ["id", "authorId", "authorName", "content", "createdAt"]
@@ -113,24 +157,45 @@
         "conversationId": { "type": "string", "description": "Parent conversation ID" },
         "senderId": { "type": "string", "description": "Sender UID" },
         "senderName": { "type": "string", "maxLength": 100, "description": "Sender display name" },
+        "messageType": { "type": "string", "enum": ["text", "image", "video", "audio", "sticker"], "description": "Message payload type" },
         "text": { "type": "string", "maxLength": 2000, "description": "Message text" },
         "mediaURL": { "type": "string", "maxLength": 1000, "description": "Optional attached media URL" },
+        "mediaType": { "type": "string", "enum": ["image", "video"], "description": "Media type" },
+        "mediaPath": { "type": "string", "maxLength": 500, "description": "Supabase Storage object path" },
+        "mediaMetadata": { "type": "object", "description": "Supabase Storage object metadata" },
+        "audioURL": { "type": "string", "maxLength": 1000, "description": "Voice note URL" },
+        "audioDurationSec": { "type": "number", "description": "Voice note duration in seconds" },
+        "stickerId": { "type": "string", "description": "Selected sticker ID" },
+        "replyTo": { "type": "object", "description": "Quoted message snippet" },
+        "reactions": { "type": "object", "description": "Emoji reaction map" },
+        "editedAt": { "type": "string", "description": "Timestamp of last edit" },
+        "deletedAt": { "type": "string", "description": "Soft delete timestamp" },
         "createdAt": { "type": "string", "description": "Message timestamp" }
       },
       "required": ["id", "conversationId", "senderId", "text", "createdAt"]
     },
     "Story": {
       "title": "Story",
-      "description": "Ephemeral 24-hour visual story",
+      "description": "Ephemeral 24-hour visual or text story",
       "type": "object",
       "properties": {
         "id": { "type": "string", "description": "Story ID" },
         "authorId": { "type": "string", "description": "Author UID" },
         "authorName": { "type": "string", "maxLength": 100, "description": "Author display name" },
         "authorPhotoURL": { "type": "string", "maxLength": 1000, "description": "Author photo URL" },
-        "mediaURL": { "type": "string", "maxLength": 1000, "description": "Image or media URL" },
+        "mediaURL": { "type": "string", "maxLength": 1000, "description": "Image or video URL" },
+        "mediaType": { "type": "string", "enum": ["image", "video"], "description": "Story media type" },
+        "mediaPath": { "type": "string", "maxLength": 500, "description": "Supabase Storage object path" },
+        "mediaMetadata": { "type": "object", "description": "Supabase Storage object metadata" },
+        "mediaScale": { "type": "number", "description": "Crop zoom scale factor" },
+        "mediaOffsetX": { "type": "number", "description": "Crop horizontal offset percentage" },
+        "mediaOffsetY": { "type": "number", "description": "Crop vertical offset percentage" },
+        "overlayText": { "type": "string", "maxLength": 500, "description": "Story text overlay or stylized text body" },
+        "bgStyle": { "type": "string", "description": "Background style preset for text stories" },
+        "durationSec": { "type": "number", "description": "Display duration in seconds" },
         "caption": { "type": "string", "maxLength": 200, "description": "Optional story caption" },
-        "viewers": { "type": "array", "description": "Array of viewer UIDs" },
+        "visibility": { "type": "string", "enum": ["followers"], "description": "Followers-only visibility" },
+        "viewCount": { "type": "number", "description": "Total story views counter" },
         "createdAt": { "type": "string", "description": "Creation timestamp" },
         "expiresAt": { "type": "string", "description": "Expiration timestamp (24h after creation)" }
       },
@@ -138,7 +203,7 @@
     },
     "Notification": {
       "title": "Notification",
-      "description": "Real-time user notification",
+      "description": "Real-time user notification including global group activities",
       "type": "object",
       "properties": {
         "id": { "type": "string", "description": "Notification ID" },
@@ -146,8 +211,16 @@
         "senderId": { "type": "string", "description": "Actor UID" },
         "senderName": { "type": "string", "maxLength": 100, "description": "Actor display name" },
         "senderPhotoURL": { "type": "string", "maxLength": 1000, "description": "Actor photo URL" },
-        "type": { "type": "string", "enum": ["like", "comment", "follow", "message"], "description": "Event type" },
-        "targetId": { "type": "string", "maxLength": 128, "description": "Target entity ID (postId, etc)" },
+        "type": {
+          "type": "string",
+          "enum": [
+            "like", "comment", "repost", "follow", "message", "event", "badge", "title", "room_invite",
+            "room_announcement", "announcement", "verification", "moderation"
+          ],
+          "description": "Event type"
+        },
+        "targetId": { "type": "string", "maxLength": 128, "description": "Target entity ID" },
+        "groupId": { "type": "string", "maxLength": 128, "description": "Related group ID" },
         "message": { "type": "string", "maxLength": 300, "description": "Notification copy" },
         "read": { "type": "boolean", "description": "Read status" },
         "createdAt": { "type": "string", "description": "Creation timestamp" }
@@ -166,6 +239,208 @@
         "lastSeen": { "type": "string", "description": "ISO timestamp of last heartbeat" }
       },
       "required": ["userId", "isOnline", "lastSeen"]
+    },
+    "VerificationRequest": {
+      "title": "VerificationRequest",
+      "description": "Account verification application submitted by a user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "userHandle": { "type": "string", "maxLength": 50 },
+        "userDisplayName": { "type": "string", "maxLength": 100 },
+        "category": { "type": "string", "enum": ["blue", "silver", "institution", "blood_red"] },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected", "more_info_needed"] },
+        "evidenceDetails": { "type": "string", "maxLength": 2000 },
+        "reviewerId": { "type": "string" },
+        "reviewerName": { "type": "string", "maxLength": 100 },
+        "reviewerNotes": { "type": "string", "maxLength": 1000 },
+        "reviewedAt": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "category", "status", "evidenceDetails", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable administrative and moderation audit trail",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "actorId": { "type": "string" },
+        "actorName": { "type": "string", "maxLength": 100 },
+        "actorRole": { "type": "string", "enum": ["user", "moderator", "admin", "owner"] },
+        "actionType": { "type": "string", "maxLength": 50 },
+        "targetType": { "type": "string", "enum": ["user", "post", "report", "verification", "appeal"] },
+        "targetId": { "type": "string", "maxLength": 128 },
+        "targetDetails": { "type": "string", "maxLength": 500 },
+        "reason": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "actorId", "actorName", "actorRole", "actionType", "targetType", "targetId", "createdAt"]
+    },
+    "Group": {
+      "title": "Group",
+      "description": "Amino-inspired community space inside Q unified network",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 100 },
+        "handle": { "type": "string", "maxLength": 50, "pattern": "^[a-z0-9_]+$" },
+        "description": { "type": "string", "maxLength": 1000 },
+        "avatarURL": { "type": "string", "maxLength": 1000 },
+        "coverURL": { "type": "string", "maxLength": 1000 },
+        "category": { "type": "string", "enum": ["gaming", "anime", "technology", "art", "education", "literature", "photography", "sports", "languages", "general"] },
+        "tags": { "type": "array" },
+        "language": { "type": "string", "enum": ["ar", "en", "tr"] },
+        "privacy": { "type": "string", "enum": ["public", "private", "approval", "invite_only"] },
+        "rules": { "type": "string", "maxLength": 3000 },
+        "ownerId": { "type": "string" },
+        "coHostIds": { "type": "array", "description": "Up to 3 Co-host UIDs assigned by the Host" },
+        "memberCount": { "type": "number" },
+        "postCount": { "type": "number" },
+        "activityScore": { "type": "number" },
+        "lastActivityAt": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "name", "handle", "category", "privacy", "ownerId", "createdAt"]
+    },
+    "GroupMember": {
+      "title": "GroupMember",
+      "description": "Group-specific membership, role (Host / Co-host / Member), XP, and notification preferences linked to global user",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "groupId": { "type": "string" },
+        "displayName": { "type": "string", "maxLength": 100 },
+        "handle": { "type": "string", "maxLength": 50 },
+        "role": { "type": "string", "enum": ["owner", "co_host", "member"] },
+        "xp": { "type": "number" },
+        "level": { "type": "number" },
+        "isBanned": { "type": "boolean" },
+        "isSuspended": { "type": "boolean" },
+        "isRestricted": { "type": "boolean" },
+        "joinedAt": { "type": "string" }
+      },
+      "required": ["userId", "groupId", "role", "joinedAt"]
+    },
+    "GroupPost": {
+      "title": "GroupPost",
+      "description": "Group post supporting text, image, gallery, video, link, poll, quiz, and question",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "groupId": { "type": "string" },
+        "type": { "type": "string", "enum": ["post", "gallery", "video", "link", "poll", "quiz", "question"] },
+        "authorId": { "type": "string" },
+        "content": { "type": "string", "maxLength": 4000 },
+        "isFeatured": { "type": "boolean" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "groupId", "type", "authorId", "content", "createdAt"]
+    },
+    "GroupAnnouncement": {
+      "title": "GroupAnnouncement",
+      "description": "Official group announcement published by leadership",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "groupId": { "type": "string" },
+        "title": { "type": "string", "maxLength": 160 },
+        "content": { "type": "string", "maxLength": 4000 },
+        "authorId": { "type": "string" },
+        "isPinned": { "type": "boolean" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "groupId", "title", "content", "authorId", "createdAt"]
+    },
+    "GroupBlog": {
+      "title": "GroupBlog",
+      "description": "Long-form group blog article with drafts, bookmarks, and reactions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "groupId": { "type": "string" },
+        "authorId": { "type": "string" },
+        "title": { "type": "string", "maxLength": 200 },
+        "content": { "type": "string", "maxLength": 12000 },
+        "status": { "type": "string", "enum": ["draft", "published"] },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "groupId", "authorId", "title", "content", "status", "createdAt"]
+    },
+    "GroupWikiEntry": {
+      "title": "GroupWikiEntry",
+      "description": "Collaborative group wiki article with editorial review and revision history",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "groupId": { "type": "string" },
+        "title": { "type": "string", "maxLength": 200 },
+        "content": { "type": "string", "maxLength": 15000 },
+        "authorId": { "type": "string" },
+        "status": { "type": "string", "enum": ["draft", "pending_review", "approved", "rejected"] },
+        "currentVersion": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "groupId", "title", "content", "authorId", "status", "currentVersion", "createdAt"]
+    },
+    "GroupChatRoom": {
+      "title": "GroupChatRoom",
+      "description": "Public, private, staff, event, or topic chat room inside a group",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "groupId": { "type": "string" },
+        "title": { "type": "string", "maxLength": 100 },
+        "type": { "type": "string", "enum": ["public", "private", "staff", "event", "topic"] },
+        "ownerId": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "groupId", "title", "type", "ownerId", "createdAt"]
+    },
+    "GroupLiveSession": {
+      "title": "GroupLiveSession",
+      "description": "WebRTC-signaled voice room, video/screening session, or live broadcast inside a group",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "groupId": { "type": "string" },
+        "mode": { "type": "string", "enum": ["voice", "video", "broadcast"] },
+        "title": { "type": "string", "maxLength": 140 },
+        "hostId": { "type": "string" },
+        "status": { "type": "string", "enum": ["live", "ended"] },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "groupId", "mode", "title", "hostId", "status", "createdAt"]
+    },
+    "GroupEvent": {
+      "title": "GroupEvent",
+      "description": "Scheduled online or in-person event within a group",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "groupId": { "type": "string" },
+        "title": { "type": "string", "maxLength": 150 },
+        "dateStr": { "type": "string", "maxLength": 40 },
+        "timeStr": { "type": "string", "maxLength": 40 },
+        "creatorId": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "groupId", "title", "dateStr", "creatorId", "createdAt"]
+    },
+    "GroupCompetition": {
+      "title": "GroupCompetition",
+      "description": "Group competition with rules, submissions, community voting, and judges",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "groupId": { "type": "string" },
+        "title": { "type": "string", "maxLength": 150 },
+        "status": { "type": "string", "enum": ["open", "voting", "completed"] },
+        "creatorId": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "groupId", "title", "status", "creatorId", "createdAt"]
     }
   },
   "firestore": {
@@ -176,6 +451,10 @@
     "/users/{userId}/private/{infoId}": {
       "schema": { "$ref": "#/entities/UserPrivate" },
       "description": "Private user information isolated to owner and admins"
+    },
+    "/users/{userId}/admin_notes/{noteId}": {
+      "schema": { "$ref": "#/entities/AdminNote" },
+      "description": "Private internal administrative notes restricted strictly to verified administrators"
     },
     "/posts/{postId}": {
       "schema": { "$ref": "#/entities/Post" },
@@ -203,7 +482,10 @@
     },
     "/stories/{storyId}": {
       "schema": { "$ref": "#/entities/Story" },
-      "description": "Active 24h stories"
+      "description": "Active 24h stories visible only to author, followers, and admins"
+    },
+    "/stories/{storyId}/viewers/{viewerId}": {
+      "description": "Private story viewer records readable only by the story author and admins"
     },
     "/notifications/{notificationId}": {
       "schema": { "$ref": "#/entities/Notification" },
@@ -212,6 +494,38 @@
     "/presence/{userId}": {
       "schema": { "$ref": "#/entities/Presence" },
       "description": "Real user presence heartbeats"
+    },
+    "/verification_requests/{requestId}": {
+      "schema": { "$ref": "#/entities/VerificationRequest" },
+      "description": "User verification applications"
+    },
+    "/audit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Immutable administrative audit logs"
+    },
+    "/chatRooms/{roomId}": {
+      "description": "Standalone public, private, and staff chat rooms with custom appearance and roles"
+    },
+    "/chatRooms/{roomId}/announcements/{annId}": {
+      "description": "Pinned announcements inside a chat room"
+    },
+    "/chatRooms/{roomId}/moderationLogs/{logId}": {
+      "description": "Moderation history log inside a chat room"
+    },
+    "/globalAdminRoles/{roleId}": {
+      "description": "Owner-managed custom administrative roles and granular global permissions"
+    },
+    "/platformAnnouncements/{annId}": {
+      "description": "Official platform announcements displayed in Discover and notifications"
+    },
+    "/platformAds/{adId}": {
+      "description": "Official platform advertisements with scheduling and pause controls"
+    },
+    "/customTitles/{titleId}": {
+      "description": "Cosmetic custom title presets created by administration"
+    },
+    "/xpLogs/{logId}": {
+      "description": "Verified real user XP progression logs"
     }
   }
 }

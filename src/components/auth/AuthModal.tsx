@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
-import { Loader2, Mail, Lock, User, Sparkles } from 'lucide-react';
+import { Loader2, Mail, Lock, User } from 'lucide-react';
+import { sendPasswordResetEmail } from 'firebase/auth';
+import { auth } from '../../firebase/config';
 import { Modal } from '../common/Modal';
 import { useAuth } from '../../context/AuthContext';
 import { QLogo } from '../common/QLogo';
@@ -18,6 +20,8 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+  const [resetMsg, setResetMsg] = useState('');
+  const [resetting, setResetting] = useState(false);
 
   if (!isOpen) return null;
 
@@ -66,6 +70,25 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
     }
   };
 
+  const handleForgotPassword = async () => {
+    setErrorMsg('');
+    setResetMsg('');
+    const targetEmail = email.trim();
+    if (!targetEmail) {
+      setErrorMsg('أدخل بريدك الإلكتروني في الحقل أعلاه ثم اضغط على نسيت كلمة المرور.');
+      return;
+    }
+    try {
+      setResetting(true);
+      await sendPasswordResetEmail(auth, targetEmail);
+      setResetMsg(`تم إرسال رابط إعادة تعيين كلمة المرور إلى ${targetEmail}`);
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'تعذر إرسال رابط إعادة التعيين. تأكد من صحة البريد الإلكتروني.');
+    } finally {
+      setResetting(false);
+    }
+  };
+
   return (
     <Modal isOpen={isOpen} onClose={onClose} title="" maxWidth="max-w-md">
       <div className="space-y-5 pt-1">
@@ -74,16 +97,16 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
           <div className="flex justify-center">
             <QLogo size={52} variant="icon" />
           </div>
-          <h3 className="text-base font-bold text-white font-tajawal tracking-tight">
+          <h3 className="text-base font-bold text-slate-900 dark:text-white font-tajawal tracking-tight">
             الانضمام إلى مجتمع Q
           </h3>
-          <p className="text-xs text-neutral-400 font-tajawal max-w-xs mx-auto">
+          <p className="text-xs text-slate-600 dark:text-neutral-400 font-tajawal max-w-xs mx-auto">
             مساحة اجتماعية راقية للمبدعين والمفكرين بنظام مصادقة وتشفير متكامل.
           </p>
         </div>
 
-        {/* Tab switcher: تسجيل الدخول / إنشاء حساب */}
-        <div className="flex rounded-xl bg-[#0B0F19] p-1 border border-[#2A2F3A] text-xs font-bold font-tajawal">
+        {/* Tab switcher */}
+        <div className="flex rounded-xl bg-slate-100 dark:bg-[#0B0F19] p-1 border border-slate-200 dark:border-[#2A2F3A] text-xs font-bold font-tajawal">
           <button
             type="button"
             onClick={() => {
@@ -93,7 +116,7 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
             className={`flex-1 py-2 rounded-lg transition-all cursor-pointer ${
               authMode === 'signin'
                 ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-                : 'text-[#94A3B8] hover:text-white'
+                : 'text-slate-600 dark:text-[#94A3B8] hover:text-slate-900 dark:hover:text-white'
             }`}
           >
             تسجيل الدخول
@@ -107,7 +130,7 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
             className={`flex-1 py-2 rounded-lg transition-all cursor-pointer ${
               authMode === 'signup'
                 ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-                : 'text-[#94A3B8] hover:text-white'
+                : 'text-slate-600 dark:text-[#94A3B8] hover:text-slate-900 dark:hover:text-white'
             }`}
           >
             إنشاء حساب جديد
@@ -119,10 +142,10 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
           type="button"
           onClick={handleGoogleLogin}
           disabled={submitting}
-          className="w-full flex items-center justify-center gap-2.5 py-3 px-4 rounded-xl bg-white hover:bg-neutral-100 text-black font-bold text-xs tracking-wide shadow-md active:scale-95 disabled:opacity-50 transition-all cursor-pointer font-tajawal"
+          className="w-full flex items-center justify-center gap-2.5 py-3 px-4 rounded-xl bg-slate-900 dark:bg-white hover:bg-slate-800 dark:hover:bg-neutral-100 text-white dark:text-black font-bold text-xs tracking-wide shadow-md active:scale-95 disabled:opacity-50 transition-all cursor-pointer font-tajawal"
         >
           {submitting ? (
-            <Loader2 className="w-4 h-4 animate-spin text-neutral-900" />
+            <Loader2 className="w-4 h-4 animate-spin" />
           ) : (
             <>
               <svg className="w-4 h-4" viewBox="0 0 24 24">
@@ -149,8 +172,8 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
         </button>
 
         <div className="relative flex items-center justify-center">
-          <div className="border-t border-[#2A2F3A] w-full" />
-          <span className="bg-[#161B26] px-3 text-[10px] text-[#94A3B8] uppercase font-tajawal shrink-0">
+          <div className="border-t border-slate-200 dark:border-[#2A2F3A] w-full" />
+          <span className="bg-white dark:bg-[#161B26] px-3 text-[10px] text-slate-500 dark:text-[#94A3B8] uppercase font-tajawal shrink-0">
             أو عبر البريد الإلكتروني
           </span>
         </div>
@@ -158,48 +181,66 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
         {/* Real Email & Password Form */}
         <form onSubmit={handleSubmit} className="space-y-3">
           {errorMsg && (
-            <div className="p-2.5 rounded-xl bg-red-950/40 border border-red-500/40 text-red-300 text-xs font-tajawal text-center">
+            <div className="p-2.5 rounded-xl bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-500/40 text-red-600 dark:text-red-300 text-xs font-tajawal text-center">
               {errorMsg}
+            </div>
+          )}
+          {resetMsg && (
+            <div className="p-2.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-500/40 text-emerald-700 dark:text-emerald-300 text-xs font-tajawal text-center">
+              {resetMsg}
             </div>
           )}
 
           {authMode === 'signup' && (
             <div className="relative">
-              <User className="w-4 h-4 text-[#94A3B8] absolute start-3.5 top-1/2 -translate-y-1/2" />
+              <User className="w-4 h-4 text-slate-400 dark:text-[#94A3B8] absolute start-3.5 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
                 required
                 placeholder="الاسم الكامل أو اسم العرض"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
-                className="w-full bg-[#0B0F19] border border-[#2A2F3A] focus:border-[#3B6DFF] rounded-xl ps-10 pe-4 py-2.5 text-xs text-white placeholder-[#64748B] focus:outline-none font-tajawal transition-colors"
+                className="w-full bg-slate-50 dark:bg-[#0B0F19] border border-slate-200 dark:border-[#2A2F3A] focus:border-[#3B6DFF] rounded-xl ps-10 pe-4 py-2.5 text-xs text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-[#64748B] focus:outline-none font-tajawal transition-colors"
               />
             </div>
           )}
 
           <div className="relative">
-            <Mail className="w-4 h-4 text-[#94A3B8] absolute start-3.5 top-1/2 -translate-y-1/2" />
+            <Mail className="w-4 h-4 text-slate-400 dark:text-[#94A3B8] absolute start-3.5 top-1/2 -translate-y-1/2" />
             <input
               type="email"
               required
               placeholder="البريد الإلكتروني"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="w-full bg-[#0B0F19] border border-[#2A2F3A] focus:border-[#3B6DFF] rounded-xl ps-10 pe-4 py-2.5 text-xs text-white placeholder-[#64748B] focus:outline-none font-tajawal transition-colors"
+              className="w-full bg-slate-50 dark:bg-[#0B0F19] border border-slate-200 dark:border-[#2A2F3A] focus:border-[#3B6DFF] rounded-xl ps-10 pe-4 py-2.5 text-xs text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-[#64748B] focus:outline-none font-tajawal transition-colors"
             />
           </div>
 
           <div className="relative">
-            <Lock className="w-4 h-4 text-[#94A3B8] absolute start-3.5 top-1/2 -translate-y-1/2" />
+            <Lock className="w-4 h-4 text-slate-400 dark:text-[#94A3B8] absolute start-3.5 top-1/2 -translate-y-1/2" />
             <input
               type="password"
               required
               placeholder="كلمة المرور (6 أحرف على الأقل)"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full bg-[#0B0F19] border border-[#2A2F3A] focus:border-[#3B6DFF] rounded-xl ps-10 pe-4 py-2.5 text-xs text-white placeholder-[#64748B] focus:outline-none font-tajawal transition-colors"
+              className="w-full bg-slate-50 dark:bg-[#0B0F19] border border-slate-200 dark:border-[#2A2F3A] focus:border-[#3B6DFF] rounded-xl ps-10 pe-4 py-2.5 text-xs text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-[#64748B] focus:outline-none font-tajawal transition-colors"
             />
           </div>
+
+          {authMode === 'signin' && (
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={handleForgotPassword}
+                disabled={resetting}
+                className="text-[11px] font-bold text-[#3B6DFF] hover:underline font-tajawal cursor-pointer disabled:opacity-50"
+              >
+                {resetting ? 'جاري الإرسال...' : 'نسيت كلمة المرور؟'}
+              </button>
+            </div>
+          )}
 
           <button
             type="submit"

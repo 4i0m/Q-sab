@@ -27,51 +27,299 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
     }
 
+    function isBootstrappedAdmin() {
+      return isSignedIn()
+        && request.auth.token.email == 'sabosenpai33@gmail.com'
+        && request.auth.token.email_verified == true;
+    }
+
     function isAdmin() {
       return isSignedIn() && (
+        isBootstrappedAdmin() ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
          getUserRole() in ['admin', 'owner'])
       );
     }
 
-    function isModerator() {
+    function isSeniorStaff() {
       return isSignedIn() && (
         isAdmin() ||
         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-         getUserRole() in ['moderator', 'admin', 'owner'])
+         getUserRole() == 'assistant_admin')
+      );
+    }
+
+    function isOwner() {
+      return isSignedIn() && (
+        isBootstrappedAdmin() ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         getUserRole() == 'owner')
+      );
+    }
+
+    function hasGlobalPerm(permKey) {
+      return isAdmin() || (
+        isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        'globalPermissions' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.globalPermissions[permKey] == true
+      );
+    }
+
+    function isModerator() {
+      return isSignedIn() && (
+        isSeniorStaff() ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         getUserRole() in ['room_leader', 'moderator', 'assistant_admin', 'admin', 'owner'])
+      );
+    }
+
+    function isValidUserPayload(data) {
+      return data.displayName is string
+        && data.displayName.size() > 0
+        && data.displayName.size() <= 100
+        && data.handle is string
+        && data.handle.size() > 0
+        && data.handle.size() <= 50
+        && (!('bio' in data) || (data.bio is string && data.bio.size() <= 500))
+        && (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 1000))
+        && (!('bannerURL' in data) || (data.bannerURL is string && data.bannerURL.size() <= 1000));
+    }
+
+    function validCounterDelta(field) {
+      return !(field in incoming()) || (
+        incoming()[field] is number &&
+        incoming()[field] >= 0 &&
+        (!(field in existing()) ? incoming()[field] <= 1 :
+          (incoming()[field] - existing()[field] >= -1 && incoming()[field] - existing()[field] <= 1))
+      );
+    }
+
+    function validBoundedIncrement(field, minDelta, maxDelta) {
+      return !(field in incoming()) || (
+        incoming()[field] is number &&
+        incoming()[field] >= 0 &&
+        (!(field in existing()) ? (incoming()[field] >= 0 && incoming()[field] <= maxDelta) :
+          (incoming()[field] - existing()[field] >= minDelta && incoming()[field] - existing()[field] <= maxDelta))
+      );
+    }
+
+    /* =======================================================================
+       GROUP MEMBERSHIP & PERMISSION HELPERS (RBAC + BAN ENFORCEMENT)
+       ======================================================================= */
+
+    function groupDoc(groupId) {
+      return get(/databases/$(database)/documents/groups/$(groupId)).data;
+    }
+
+    function memberPath(groupId, uid) {
+      return /databases/$(database)/documents/groups/$(groupId)/members/$(uid);
+    }
+
+    function hasMemberDoc(groupId) {
+      return isSignedIn() && exists(memberPath(groupId, request.auth.uid));
+    }
+
+    function memberData(groupId) {
+      return get(memberPath(groupId, request.auth.uid)).data;
+    }
+
+    function isGroupBanned(groupId) {
+      return hasMemberDoc(groupId) && memberData(groupId).isBanned == true;
+    }
+
+    function isGroupActiveMember(groupId) {
+      return hasMemberDoc(groupId)
+        && memberData(groupId).isBanned != true;
+    }
+
+    function isGroupUnrestrictedMember(groupId) {
+      return isGroupActiveMember(groupId)
+        && memberData(groupId).isSuspended != true
+        && memberData(groupId).isRestricted != true;
+    }
+
+    function isGroupOwner(groupId) {
+      return isSignedIn() && (
+        groupDoc(groupId).ownerId == request.auth.uid ||
+        (isGroupActiveMember(groupId) && memberData(groupId).role == 'owner')
+      );
+    }
+
+    function isGroupStaff(groupId) {
+      return isAdmin() || isGroupOwner(groupId) || (
+        isGroupActiveMember(groupId) &&
+        memberData(groupId).isSuspended != true &&
+        memberData(groupId).role in ['owner', 'co_host', 'co_leader', 'coordinator', 'moderator', 'assistant']
+      );
+    }
+
+    function hasGroupPerm(groupId, permKey) {
+      return isAdmin() || isGroupOwner(groupId) || (
+        isGroupActiveMember(groupId) &&
+        memberData(groupId).isSuspended != true &&
+        'permissions' in memberData(groupId) &&
+        memberData(groupId).permissions[permKey] == true
+      );
+    }
+
+    function canAccessGroupContent(groupId) {
+      return isAdmin() || (
+        !isGroupBanned(groupId) && (
+          groupDoc(groupId).privacy == 'public' ||
+          isGroupActiveMember(groupId)
+        )
+      );
+    }
+
+    function chatRoomDoc(groupId, roomId) {
+      return get(/databases/$(database)/documents/groups/$(groupId)/chatRooms/$(roomId)).data;
+    }
+
+    function canAccessChatRoom(groupId, roomId) {
+      return isAdmin() || (!isGroupBanned(groupId) && (
+        (chatRoomDoc(groupId, roomId).type in ['public', 'topic', 'event'] && canAccessGroupContent(groupId)) ||
+        (chatRoomDoc(groupId, roomId).type == 'staff' && isGroupStaff(groupId)) ||
+        (chatRoomDoc(groupId, roomId).type == 'private' && isGroupActiveMember(groupId) && (
+          request.auth.uid in chatRoomDoc(groupId, roomId).invitedUserIds ||
+          chatRoomDoc(groupId, roomId).ownerId == request.auth.uid ||
+          request.auth.uid in chatRoomDoc(groupId, roomId).moderatorIds ||
+          hasGroupPerm(groupId, 'manageChats')
+        ))
+      ));
+    }
+
+    // CollectionGroup query rule allowing a signed-in user to list their own memberships across Q
+    match /{path=**}/members/{memberId} {
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // CollectionGroup query rule allowing a signed-in user to list their own pending group invitations
+    match /{path=**}/invitations/{inviteId} {
+      allow list: if isSignedIn() && (
+        resource.data.inviteeId == request.auth.uid ||
+        resource.data.inviterId == request.auth.uid
       );
     }
 
     // User Public Profile
     match /users/{userId} {
-      // Public directory allows visitors to view member profiles
       allow get, list: if true;
+
       allow create: if isSignedIn() && isValidId(userId) && request.auth.uid == userId
         && incoming().id == userId
-        && (incoming().role == 'user' || (isAdmin() && incoming().role in ['user', 'moderator', 'admin', 'owner']))
-        && incoming().displayName is string && incoming().displayName.size() <= 100
-        && incoming().handle is string && incoming().handle.size() <= 50;
+        && isValidUserPayload(incoming())
+        && (
+          (incoming().role == 'user'
+            && (!('isVerified' in incoming()) || incoming().isVerified == false)
+            && (!('verificationStatus' in incoming()) || incoming().verificationStatus == 'not_verified')
+            && (!('level' in incoming()) || incoming().level == 0)
+            && (!('xp' in incoming()) || incoming().xp == 0)
+            && (!('isSpecial' in incoming()) || incoming().isSpecial == false)) ||
+          (isAdmin() && incoming().role in ['user', 'moderator', 'admin', 'owner'])
+        );
+
       allow update: if isSignedIn() && isValidId(userId) && (
-        isAdmin() ||
+        (
+          isAdmin() &&
+          !(existing().role == 'owner' && request.auth.uid != userId &&
+            incoming().diff(existing()).affectedKeys().hasAny(['role', 'isSuspended', 'isBanned', 'isRestricted'])) &&
+          (!('role' in incoming().diff(existing()).affectedKeys()) ||
+            (incoming().role != 'owner' || existing().role == 'owner'))
+        ) ||
+        (
+          hasGlobalPerm('manageUsers') &&
+          !(existing().role in ['owner', 'admin']) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'isRestricted', 'restrictedUntil', 'restrictionReason',
+            'isSuspended', 'suspensionReason', 'isBanned', 'bannedReason', 'warningCount'
+          ])
+        ) ||
+        (
+          hasGlobalPerm('manageRoles') &&
+          !(existing().role in ['owner', 'admin']) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'customRoleId', 'customRoleName', 'globalPermissions', 'role'
+          ]) &&
+          (!('role' in incoming().diff(existing()).affectedKeys()) ||
+            incoming().role in ['user', 'moderator', 'room_leader', 'assistant_admin'])
+        ) ||
+        (
+          hasGlobalPerm('manageTitles') &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['customTitle', 'customTitles'])
+        ) ||
+        (
+          isSeniorStaff() &&
+          !(existing().role in ['owner', 'admin', 'assistant_admin']) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'customTitle', 'customTitles', 'isRestricted', 'restrictedUntil', 'restrictionReason',
+            'isSuspended', 'suspensionReason', 'warningCount', 'role'
+          ]) &&
+          (!('role' in incoming().diff(existing()).affectedKeys()) ||
+            incoming().role in ['user', 'moderator', 'room_leader'])
+        ) ||
+        (
+          isModerator() &&
+          existing().role == 'user' &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'isRestricted', 'restrictedUntil', 'restrictionReason', 'warningCount'
+          ])
+        ) ||
         (
           request.auth.uid == userId &&
-          !incoming().diff(existing()).affectedKeys().hasAny(['role', 'id', 'createdAt', 'isVerified', 'verificationCategory', 'isSuspended', 'isBanned', 'warningCount'])
+          isValidUserPayload(incoming()) &&
+          !incoming().diff(existing()).affectedKeys().hasAny([
+            'role', 'customRoleId', 'customRoleName', 'globalPermissions',
+            'id', 'createdAt',
+            'xp', 'level', 'achievements', 'isSpecial', 'customTitle', 'customTitles',
+            'followersCount', 'followingCount', 'postsCount',
+            'isVerified', 'verificationCategory', 'verificationStatus',
+            'verifiedAt', 'verifiedBy', 'verifiedByName', 'verificationNote',
+            'isRestricted', 'restrictedUntil', 'restrictionReason',
+            'isSuspended', 'isBanned', 'warningCount', 'suspensionReason', 'bannedReason'
+          ])
         ) ||
-        // Allow updating counters during social interactions
-        incoming().diff(existing()).affectedKeys().hasOnly(['followersCount', 'followingCount', 'postsCount'])
+        (
+          request.auth.uid == userId &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['xp', 'level', 'lastActiveAt']) &&
+          validBoundedIncrement('xp', 0, 25) &&
+          (!('level' in incoming()) || (
+            incoming().level is int &&
+            incoming().level >= 1 &&
+            incoming().level <= 100 &&
+            incoming().level <= (existing().level + 1)
+          ))
+        ) ||
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['followersCount', 'followingCount', 'postsCount']) &&
+          validCounterDelta('followersCount') &&
+          validCounterDelta('followingCount') &&
+          validCounterDelta('postsCount')
+        )
       );
-      // Owner can delete their own account or admin
+
       allow delete: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
 
-      // Isolated PII Subcollection
+      // Isolated PII Subcollection (get vs list properly separated)
       match /private/{docId} {
-        allow read, write: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+        allow get: if isSignedIn() && isValidId(docId) && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+        allow write: if isSignedIn() && isValidId(docId) && (request.auth.uid == userId || isAdmin());
       }
 
-      // User Bookmarked Posts
+      // Strictly Admin-Only Internal Notes Subcollection
+      match /admin_notes/{noteId} {
+        allow get: if isAdmin() && isValidId(noteId);
+        allow list: if isAdmin();
+        allow write: if isAdmin() && isValidId(noteId);
+      }
+
+      // User Bookmarked Posts (get vs list separated so collection queries succeed)
       match /bookmarks/{postId} {
-        allow read, write: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+        allow get: if isSignedIn() && isValidId(postId) && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+        allow write: if isSignedIn() && isValidId(postId) && (request.auth.uid == userId || isAdmin());
       }
     }
 
@@ -81,21 +329,44 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
-    // Posts Collection (Public Feed)
+    // Posts Collection (Public Feed: Post, Blog, Wiki, Question, Poll, Quiz)
     match /posts/{postId} {
       allow get, list: if true;
-      // Must be authenticated and authorId must strictly match request.auth.uid
       allow create: if isSignedIn() && isValidId(postId)
         && incoming().authorId == request.auth.uid
-        && incoming().content is string && incoming().content.size() <= 2000;
+        && incoming().content is string && incoming().content.size() <= 10000
+        && (!('mediaURLs' in incoming()) || (incoming().mediaURLs is list && incoming().mediaURLs.size() <= 4));
       allow update: if isValidId(postId) && isSignedIn() && (
         isAdmin() ||
+        (existing().postType == 'wiki' && (isSeniorStaff() || hasGlobalPerm('manageWiki')) &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'title', 'content', 'tags', 'updatedAt', 'editedAt', 'editedBy', 'editedByName'
+         ]) &&
+         incoming().content is string && incoming().content.size() <= 10000) ||
         (existing().authorId == request.auth.uid &&
-         !incoming().diff(existing()).affectedKeys().hasAny(['id', 'authorId', 'createdAt'])) ||
-        // Social reactions counter update
-        incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'commentsCount', 'sharesCount', 'bookmarksCount'])
+         !incoming().diff(existing()).affectedKeys().hasAny([
+           'id', 'authorId', 'createdAt', 'isHidden',
+           'likesCount', 'commentsCount', 'sharesCount', 'bookmarksCount'
+         ]) &&
+         incoming().content is string && incoming().content.size() <= 10000) ||
+        (incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'commentsCount', 'repostsCount', 'sharesCount', 'bookmarksCount']) &&
+         validCounterDelta('likesCount') &&
+         validCounterDelta('commentsCount') &&
+         validCounterDelta('repostsCount') &&
+         validCounterDelta('sharesCount') &&
+         validCounterDelta('bookmarksCount')) ||
+        (
+          'poll' in existing() &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['poll']) &&
+          incoming().poll.question == existing().poll.question
+        ) ||
+        (
+          'quiz' in existing() &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['quiz']) &&
+          incoming().quiz.title == existing().quiz.title &&
+          incoming().quiz.questions == existing().quiz.questions
+        )
       );
-      // STRICT: Only the post author or verified administrator can delete the post
       allow delete: if isValidId(postId) && isSignedIn() && (
         isAdmin() || existing().authorId == request.auth.uid
       );
@@ -105,9 +376,14 @@ service cloud.firestore {
         allow get, list: if true;
         allow create: if isSignedIn() && isValidId(commentId)
           && incoming().authorId == request.auth.uid
-          && incoming().text is string && incoming().text.size() <= 1000;
+          && incoming().text is string && incoming().text.size() > 0 && incoming().text.size() <= 1500;
         allow update: if isSignedIn() && isValidId(commentId) && (
-          existing().authorId == request.auth.uid || isAdmin()
+          existing().authorId == request.auth.uid ||
+          (
+            get(/databases/$(database)/documents/posts/$(postId)).data.authorId == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['isBestAnswer'])
+          ) ||
+          isAdmin()
         );
         allow delete: if isSignedIn() && isValidId(commentId) && (
           existing().authorId == request.auth.uid ||
@@ -116,10 +392,22 @@ service cloud.firestore {
         );
       }
 
-      // Likes Subcollection (Identity-locked: only owner can like/unlike under their own UID)
+      // Likes Subcollection
       match /likes/{userId} {
         allow get, list: if true;
         allow create, delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      }
+
+      // Global Poll Votes Subcollection
+      match /votes/{userId} {
+        allow get, list: if true;
+        allow create, update: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      }
+
+      // Global Quiz Attempts Subcollection
+      match /attempts/{userId} {
+        allow get, list: if true;
+        allow create, update: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
       }
     }
 
@@ -147,7 +435,6 @@ service cloud.firestore {
       );
       allow delete: if isAdmin();
 
-      // Conversation Messages Subcollection
       match /messages/{messageId} {
         allow get: if isSignedIn() && isValidId(messageId) && (
           (request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds) || isAdmin()
@@ -157,28 +444,69 @@ service cloud.firestore {
         );
         allow create: if isSignedIn() && isValidId(messageId)
           && incoming().senderId == request.auth.uid
+          && incoming().text is string && incoming().text.size() <= 2000
           && (request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds);
-        allow update, delete: if isSignedIn() && isValidId(messageId) && (
+        allow update: if isSignedIn() && isValidId(messageId) && (
+          existing().senderId == request.auth.uid ||
+          isAdmin() ||
+          (
+            (request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['reactions'])
+          )
+        );
+        allow delete: if isSignedIn() && isValidId(messageId) && (
           existing().senderId == request.auth.uid || isAdmin()
         );
       }
     }
 
-    // Stories Collection (Public 24h stories)
+    // Stories Collection (Followers & Author & Admin Only + Isolated Viewers Subcollection)
     match /stories/{storyId} {
-      allow get, list: if true;
+      allow get, list: if isSignedIn() && (
+        resource.data.authorId == request.auth.uid ||
+        isAdmin() ||
+        exists(/databases/$(database)/documents/follows/$(request.auth.uid + '_' + resource.data.authorId))
+      );
       allow create: if isSignedIn() && isValidId(storyId)
         && incoming().authorId == request.auth.uid
-        && incoming().mediaURL is string && incoming().mediaURL.size() <= 1000;
+        && incoming().mediaURL is string && incoming().mediaURL.size() <= 1000
+        && (incoming().mediaURL.size() > 0 || ('overlayText' in incoming() && incoming().overlayText is string && incoming().overlayText.size() > 0));
       allow update: if isSignedIn() && isValidId(storyId) && (
-        (existing().authorId == request.auth.uid) ||
-        // Allowing viewer recording
-        incoming().diff(existing()).affectedKeys().hasOnly(['viewers']) ||
-        isAdmin()
+        existing().authorId == request.auth.uid ||
+        isAdmin() ||
+        (
+          (exists(/databases/$(database)/documents/follows/$(request.auth.uid + '_' + existing().authorId))) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['viewCount']) &&
+          validCounterDelta('viewCount')
+        )
       );
       allow delete: if isSignedIn() && isValidId(storyId) && (
         existing().authorId == request.auth.uid || isAdmin()
       );
+
+      // Strict Owner-Only Viewers List Subcollection
+      match /viewers/{viewerId} {
+        allow get: if isSignedIn() && isValidId(viewerId) && (
+          request.auth.uid == viewerId ||
+          get(/databases/$(database)/documents/stories/$(storyId)).data.authorId == request.auth.uid ||
+          isAdmin()
+        );
+        allow list: if isSignedIn() && (
+          get(/databases/$(database)/documents/stories/$(storyId)).data.authorId == request.auth.uid ||
+          isAdmin()
+        );
+        allow create, update: if isSignedIn() && isValidId(viewerId)
+          && request.auth.uid == viewerId
+          && incoming().viewerId == request.auth.uid
+          && (
+            get(/databases/$(database)/documents/stories/$(storyId)).data.authorId == request.auth.uid ||
+            isAdmin() ||
+            exists(/databases/$(database)/documents/follows/$(request.auth.uid + '_' + get(/databases/$(database)/documents/stories/$(storyId)).data.authorId))
+          );
+        allow delete: if isSignedIn() && isValidId(viewerId) && (
+          get(/databases/$(database)/documents/stories/$(storyId)).data.authorId == request.auth.uid || isAdmin()
+        );
+      }
     }
 
     // Notifications Collection (Strictly Recipient Only)
@@ -190,10 +518,12 @@ service cloud.firestore {
         resource.data.recipientId == request.auth.uid || isAdmin()
       );
       allow create: if isSignedIn() && isValidId(notificationId)
-        && incoming().senderId == request.auth.uid;
+        && incoming().senderId == request.auth.uid
+        && incoming().message is string && incoming().message.size() <= 300;
       allow update: if isSignedIn() && isValidId(notificationId) && (
         resource.data.recipientId == request.auth.uid &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['read'])
+        incoming().diff(existing()).affectedKeys().hasOnly(['read']) &&
+        incoming().read is bool
       );
       allow delete: if isSignedIn() && isValidId(notificationId) && (
         resource.data.recipientId == request.auth.uid || isAdmin()
@@ -207,41 +537,257 @@ service cloud.firestore {
       allow delete: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
     }
 
-    // Community Events Collection
+    // Community Events Collection (Real Events with Creator/Admin Lifecycle)
     match /events/{eventId} {
       allow get, list: if true;
-      allow create: if isAdmin();
-      allow update: if isValidId(eventId) && (
+      allow create: if isSignedIn() && isValidId(eventId)
+        && incoming().creatorId == request.auth.uid
+        && (isAdmin() || isSeniorStaff() || isModerator());
+      allow update: if isValidId(eventId) && isSignedIn() && (
         isAdmin() ||
-        (isSignedIn() && incoming().diff(existing()).affectedKeys().hasOnly(['registeredUserIds', 'participantsCount']))
+        isSeniorStaff() ||
+        (existing().creatorId == request.auth.uid && isModerator()) ||
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['registeredUserIds', 'pendingUserIds', 'participantsCount']) &&
+          (!('registeredUserIds' in incoming().diff(existing()).affectedKeys()) || (
+            incoming().registeredUserIds is list &&
+            incoming().registeredUserIds.toSet().difference(existing().registeredUserIds.toSet()).hasOnly([request.auth.uid]) &&
+            existing().registeredUserIds.toSet().difference(incoming().registeredUserIds.toSet()).hasOnly([request.auth.uid])
+          )) &&
+          (!('pendingUserIds' in incoming().diff(existing()).affectedKeys()) || (
+            incoming().pendingUserIds is list &&
+            incoming().pendingUserIds.toSet().difference(existing().pendingUserIds.toSet()).hasOnly([request.auth.uid]) &&
+            existing().pendingUserIds.toSet().difference(incoming().pendingUserIds.toSet()).hasOnly([request.auth.uid])
+          )) &&
+          validCounterDelta('participantsCount')
+        )
       );
-      allow delete: if isAdmin();
+      allow delete: if isValidId(eventId) && isSignedIn() && (
+        isAdmin() || existing().creatorId == request.auth.uid
+      );
+    }
+
+    // Standalone Real Chat Rooms (Replaces old Communities system)
+    function topRoomDoc(roomId) {
+      return get(/databases/$(database)/documents/chatRooms/$(roomId)).data;
+    }
+
+    function topRoomMemberPath(roomId, uid) {
+      return /databases/$(database)/documents/chatRooms/$(roomId)/members/$(uid);
+    }
+
+    function isTopRoomDeputyWithPerm(roomId, permKey) {
+      return isSignedIn() &&
+        exists(topRoomMemberPath(roomId, request.auth.uid)) &&
+        get(topRoomMemberPath(roomId, request.auth.uid)).data.role == 'deputy_moderator' &&
+        'permissions' in get(topRoomMemberPath(roomId, request.auth.uid)).data &&
+        get(topRoomMemberPath(roomId, request.auth.uid)).data.permissions[permKey] == true;
+    }
+
+    function isTopRoomModerator(roomId) {
+      return isSignedIn() && (
+        isAdmin() ||
+        isSeniorStaff() ||
+        hasGlobalPerm('manageRooms') ||
+        topRoomDoc(roomId).ownerId == request.auth.uid ||
+        request.auth.uid in topRoomDoc(roomId).leaderIds ||
+        request.auth.uid in topRoomDoc(roomId).moderatorIds
+      );
+    }
+
+    function canAccessTopRoom(roomId) {
+      return isAdmin() || hasGlobalPerm('manageRooms') || (
+        !(isSignedIn() && 'bannedUserIds' in topRoomDoc(roomId) && request.auth.uid in topRoomDoc(roomId).bannedUserIds) && (
+          topRoomDoc(roomId).visibility == 'public' ||
+          (isSignedIn() && (
+            isModerator() ||
+            topRoomDoc(roomId).ownerId == request.auth.uid ||
+            request.auth.uid in topRoomDoc(roomId).leaderIds ||
+            request.auth.uid in topRoomDoc(roomId).moderatorIds ||
+            ('deputyIds' in topRoomDoc(roomId) && request.auth.uid in topRoomDoc(roomId).deputyIds) ||
+            request.auth.uid in topRoomDoc(roomId).allowedUserIds
+          ))
+        )
+      );
+    }
+
+    match /chatRooms/{roomId} {
+      allow get: if isValidId(roomId) && canAccessTopRoom(roomId);
+      allow list: if resource.data.visibility == 'public' || (
+        isSignedIn() && (
+          isAdmin() ||
+          hasGlobalPerm('manageRooms') ||
+          isModerator() ||
+          resource.data.ownerId == request.auth.uid ||
+          request.auth.uid in resource.data.leaderIds ||
+          request.auth.uid in resource.data.moderatorIds ||
+          ('deputyIds' in resource.data && request.auth.uid in resource.data.deputyIds) ||
+          request.auth.uid in resource.data.allowedUserIds
+        )
+      );
+      allow create: if isSignedIn() && isValidId(roomId)
+        && incoming().ownerId == request.auth.uid
+        && incoming().title is string && incoming().title.size() >= 2 && incoming().title.size() <= 100
+        && incoming().visibility in ['public', 'private', 'staff'];
+      allow update: if isSignedIn() && isValidId(roomId) && (
+        isAdmin() ||
+        isSeniorStaff() ||
+        hasGlobalPerm('manageRooms') ||
+        existing().ownerId == request.auth.uid ||
+        request.auth.uid in existing().leaderIds ||
+        request.auth.uid in existing().moderatorIds ||
+        isTopRoomDeputyWithPerm(roomId, 'manageAppearance') ||
+        isTopRoomDeputyWithPerm(roomId, 'banMembers') ||
+        isTopRoomDeputyWithPerm(roomId, 'kickMembers') ||
+        isTopRoomDeputyWithPerm(roomId, 'muteMembers') ||
+        isTopRoomDeputyWithPerm(roomId, 'pinMessages') ||
+        isTopRoomDeputyWithPerm(roomId, 'inviteMembers') ||
+        (
+          !('bannedUserIds' in existing() && request.auth.uid in existing().bannedUserIds) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'memberCount', 'lastMessageText', 'lastMessageSenderName', 'lastMessageAt', 'updatedAt'
+          ]) &&
+          validCounterDelta('memberCount')
+        )
+      );
+      allow delete: if isSignedIn() && isValidId(roomId) && (
+        isAdmin() || hasGlobalPerm('manageRooms') || existing().ownerId == request.auth.uid
+      );
+
+      match /members/{userId} {
+        allow get, list: if canAccessTopRoom(roomId);
+        allow create: if isSignedIn() && isValidId(userId) && canAccessTopRoom(roomId) && (
+          (request.auth.uid == userId && incoming().userId == request.auth.uid && (
+            incoming().role == 'member' || topRoomDoc(roomId).ownerId == request.auth.uid
+          )) ||
+          isTopRoomModerator(roomId)
+        );
+        allow update: if isSignedIn() && isValidId(userId) && (
+          isTopRoomModerator(roomId) ||
+          (
+            request.auth.uid == userId &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['isNotificationsMuted', 'lastReadAt', 'displayName', 'photoURL'])
+          )
+        );
+        allow delete: if isSignedIn() && isValidId(userId) && (
+          request.auth.uid == userId ||
+          isTopRoomModerator(roomId) ||
+          isTopRoomDeputyWithPerm(roomId, 'kickMembers') ||
+          isTopRoomDeputyWithPerm(roomId, 'banMembers')
+        );
+      }
+
+      match /messages/{messageId} {
+        allow get, list: if canAccessTopRoom(roomId);
+        allow create: if isSignedIn() && isValidId(messageId)
+          && incoming().senderId == request.auth.uid
+          && canAccessTopRoom(roomId)
+          && !('mutedUserIds' in topRoomDoc(roomId) && request.auth.uid in topRoomDoc(roomId).mutedUserIds)
+          && incoming().text is string && incoming().text.size() <= 2000;
+        allow update: if isSignedIn() && isValidId(messageId) && (
+          existing().senderId == request.auth.uid ||
+          isTopRoomModerator(roomId) ||
+          isTopRoomDeputyWithPerm(roomId, 'deleteMessages') ||
+          isTopRoomDeputyWithPerm(roomId, 'pinMessages') ||
+          (canAccessTopRoom(roomId) && incoming().diff(existing()).affectedKeys().hasOnly(['reactions']))
+        );
+        allow delete: if isSignedIn() && isValidId(messageId) && (
+          existing().senderId == request.auth.uid ||
+          isTopRoomModerator(roomId) ||
+          isTopRoomDeputyWithPerm(roomId, 'deleteMessages')
+        );
+      }
+
+      match /announcements/{announcementId} {
+        allow get, list: if canAccessTopRoom(roomId);
+        allow create, update, delete: if isSignedIn() && isValidId(announcementId) && (
+          isTopRoomModerator(roomId) ||
+          isTopRoomDeputyWithPerm(roomId, 'manageAnnouncements')
+        );
+      }
+
+      match /moderationLogs/{logId} {
+        allow get, list: if isTopRoomModerator(roomId) || (
+          isSignedIn() && 'deputyIds' in topRoomDoc(roomId) && request.auth.uid in topRoomDoc(roomId).deputyIds
+        );
+        allow create: if isSignedIn() && isValidId(logId) && incoming().actorId == request.auth.uid && (
+          isTopRoomModerator(roomId) ||
+          ('deputyIds' in topRoomDoc(roomId) && request.auth.uid in topRoomDoc(roomId).deputyIds)
+        );
+        allow update, delete: if false;
+      }
+    }
+
+    // Cosmetic Custom Title Presets (Created by Owner / Authorized Admins)
+    match /customTitles/{titleId} {
+      allow get, list: if true;
+      allow create, update, delete: if isAdmin() || isSeniorStaff() || hasGlobalPerm('manageTitles');
+    }
+
+    // Owner-Managed Global Admin Roles
+    match /globalAdminRoles/{roleId} {
+      allow get, list: if isModerator() || hasGlobalPerm('manageRoles');
+      allow create, update, delete: if isOwner() || hasGlobalPerm('manageRoles');
+    }
+
+    // Platform Official Announcements & Ads (Public Read, Admin/Authorized Write)
+    match /platformAnnouncements/{annId} {
+      allow get, list: if true;
+      allow create, update, delete: if isAdmin() || isSeniorStaff() || hasGlobalPerm('manageAnnouncements');
+    }
+
+    match /platformAds/{adId} {
+      allow get, list: if true;
+      allow create, update, delete: if isAdmin() || isSeniorStaff() || hasGlobalPerm('manageAds');
+    }
+
+    // Real User XP Activity Logs
+    match /xpLogs/{logId} {
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && isValidId(logId)
+        && incoming().userId == request.auth.uid
+        && incoming().amount is number
+        && incoming().amount > 0
+        && incoming().amount <= 25;
+      allow update, delete: if false;
     }
 
     // Moderation Reports Collection
     match /reports/{reportId} {
-      allow get, list: if isAdmin();
-      allow create: if isSignedIn() && isValidId(reportId) && incoming().reporterId == request.auth.uid;
-      allow update, delete: if isAdmin();
+      allow get, list: if isModerator() || hasGlobalPerm('manageUsers');
+      allow create: if isSignedIn() && isValidId(reportId)
+        && incoming().reporterId == request.auth.uid
+        && incoming().reason is string && incoming().reason.size() > 0 && incoming().reason.size() <= 500;
+      allow update, delete: if isModerator() || hasGlobalPerm('manageUsers');
     }
 
-    // Four-Tier Verification Requests Collection
+    // Verification Requests Collection
     match /verification_requests/{requestId} {
       allow get: if isSignedIn() && isValidId(requestId) && (
-        resource.data.userId == request.auth.uid || isAdmin()
+        resource.data.userId == request.auth.uid || isAdmin() || hasGlobalPerm('manageVerifications')
       );
       allow list: if isSignedIn() && (
-        isAdmin() || resource.data.userId == request.auth.uid
+        isAdmin() || hasGlobalPerm('manageVerifications') || resource.data.userId == request.auth.uid
       );
       allow create: if isSignedIn() && isValidId(requestId)
-        && incoming().userId == request.auth.uid;
-      allow update, delete: if isAdmin();
+        && incoming().userId == request.auth.uid
+        && incoming().status == 'pending'
+        && incoming().category in ['blue', 'silver', 'institution']
+        && incoming().evidenceDetails is string
+        && incoming().evidenceDetails.size() > 0
+        && incoming().evidenceDetails.size() <= 2000;
+      allow update, delete: if isAdmin() || hasGlobalPerm('manageVerifications');
     }
 
-    // Administrative & Moderation Audit Logs (Immutable)
+    // Administrative & Moderation Audit Logs
     match /audit_logs/{logId} {
-      allow get, list: if isAdmin();
-      allow create: if isSignedIn() && isValidId(logId);
+      allow get, list: if isModerator() || hasGlobalPerm('viewAuditLogs');
+      allow create: if isModerator() && isValidId(logId)
+        && incoming().actorId == request.auth.uid
+        && incoming().actionType is string && incoming().actionType.size() <= 50
+        && incoming().targetId is string && incoming().targetId.size() <= 128
+        && incoming().createdAt is string;
       allow update, delete: if false;
     }
 
@@ -254,8 +800,485 @@ service cloud.firestore {
         isAdmin() || resource.data.userId == request.auth.uid
       );
       allow create: if isSignedIn() && isValidId(appealId)
-        && incoming().userId == request.auth.uid;
+        && incoming().userId == request.auth.uid
+        && incoming().status == 'pending'
+        && incoming().appealReason is string && incoming().appealReason.size() <= 2000;
       allow update, delete: if isAdmin();
+    }
+
+    /* =======================================================================
+       Q ADVANCED GROUPS ECOSYSTEM
+       ======================================================================= */
+
+    match /groups/{groupId} {
+      allow get: if isValidId(groupId) && (
+        resource.data.privacy in ['public', 'approval'] ||
+        isGroupActiveMember(groupId) ||
+        isAdmin()
+      );
+      allow list: if resource.data.privacy in ['public', 'approval']
+        || (isSignedIn() && resource.data.ownerId == request.auth.uid)
+        || isAdmin();
+
+      allow create: if isSignedIn() && isValidId(groupId)
+        && incoming().id == groupId
+        && incoming().ownerId == request.auth.uid
+        && incoming().name is string && incoming().name.size() >= 2 && incoming().name.size() <= 100
+        && incoming().handle is string && incoming().handle.size() >= 2 && incoming().handle.size() <= 50
+        && incoming().handle.matches('^[a-z0-9_]+$')
+        && incoming().privacy in ['public', 'private', 'approval', 'invite_only']
+        && (!('coHostIds' in incoming()) || (incoming().coHostIds is list && incoming().coHostIds.size() <= 3))
+        && (!('tags' in incoming()) || (incoming().tags is list && incoming().tags.size() <= 10));
+
+      allow update: if isSignedIn() && isValidId(groupId)
+        && (!('coHostIds' in incoming()) || (incoming().coHostIds is list && incoming().coHostIds.size() <= 3))
+        && (
+          isGroupOwner(groupId) ||
+          (
+            hasGroupPerm(groupId, 'manageSettings') &&
+            !incoming().diff(existing()).affectedKeys().hasAny(['ownerId', 'ownerName', 'coHostIds'])
+          ) ||
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['isFeaturedByPlatform', 'updatedAt'])) ||
+          (
+            !isGroupBanned(groupId) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['memberCount', 'postCount', 'activityScore', 'lastActivityAt', 'updatedAt']) &&
+            validCounterDelta('memberCount') &&
+            validCounterDelta('postCount') &&
+            validBoundedIncrement('activityScore', 0, 25)
+          ) ||
+          (
+            !isGroupBanned(groupId) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['memberCount', 'coHostIds']) &&
+            validCounterDelta('memberCount') &&
+            (
+              (!('coHostIds' in existing()) && incoming().coHostIds == []) ||
+              (
+                'coHostIds' in existing() &&
+                existing().coHostIds.toSet().difference(incoming().coHostIds.toSet()).hasOnly([request.auth.uid]) &&
+                incoming().coHostIds.toSet().difference(existing().coHostIds.toSet()).size() == 0
+              )
+            )
+          )
+        );
+
+      allow delete: if isSignedIn() && isValidId(groupId) && (isGroupOwner(groupId) || isAdmin());
+
+      // Group Members
+      match /members/{userId} {
+        allow get: if isValidId(userId) && canAccessGroupContent(groupId);
+        allow list: if canAccessGroupContent(groupId);
+
+        allow create: if isSignedIn() && isValidId(userId) && !isGroupBanned(groupId) && (
+          // Creator becomes owner
+          (request.auth.uid == userId && incoming().userId == request.auth.uid && incoming().role == 'owner' && groupDoc(groupId).ownerId == request.auth.uid) ||
+          // Direct join to public group as regular member
+          (request.auth.uid == userId && incoming().userId == request.auth.uid && incoming().role == 'member' && incoming().isBanned != true && groupDoc(groupId).privacy == 'public') ||
+          // Leader/staff approving a join request or accepting an invite
+          hasGroupPerm(groupId, 'manageJoinRequests') ||
+          hasGroupPerm(groupId, 'manageMembers') ||
+          // User accepting a verified group invitation document keyed by their UID
+          (request.auth.uid == userId &&
+           incoming().userId == request.auth.uid &&
+           incoming().role == 'member' &&
+           incoming().isBanned != true &&
+           exists(/databases/$(database)/documents/groups/$(groupId)/invitations/$(userId)))
+        );
+
+        allow update: if isSignedIn() && isValidId(userId) && (
+          isGroupOwner(groupId) ||
+          isAdmin() ||
+          (
+            hasGroupPerm(groupId, 'manageMembers') &&
+            !incoming().diff(existing()).affectedKeys().hasAny(['role', 'permissions', 'customRoleId', 'customRoleName']) &&
+            existing().role == 'member'
+          ) ||
+          (
+            request.auth.uid == userId &&
+            !isGroupBanned(groupId) &&
+            !incoming().diff(existing()).affectedKeys().hasAny([
+              'role', 'customRoleId', 'customRoleName', 'permissions',
+              'customTitle', 'isBanned', 'isSuspended', 'isRestricted', 'warningCount',
+              'achievements', 'isFeatured', 'userId', 'groupId', 'joinedAt'
+            ]) &&
+            validBoundedIncrement('xp', 0, 40) &&
+            (!('level' in incoming()) || (incoming().level is int && incoming().level >= 1 && incoming().level <= 100))
+          )
+        );
+
+        allow delete: if isSignedIn() && isValidId(userId) && (
+          (request.auth.uid == userId && !isGroupOwner(groupId) && !isGroupBanned(groupId)) ||
+          hasGroupPerm(groupId, 'manageMembers')
+        );
+      }
+
+      // Custom Group Roles
+      match /roles/{roleId} {
+        allow get, list: if canAccessGroupContent(groupId);
+        allow create, update, delete: if isValidId(roleId) && hasGroupPerm(groupId, 'manageStaff');
+      }
+
+      // Join Requests
+      match /joinRequests/{userId} {
+        allow get: if isSignedIn() && isValidId(userId) && (
+          request.auth.uid == userId || hasGroupPerm(groupId, 'manageJoinRequests')
+        );
+        allow list: if isSignedIn() && (
+          hasGroupPerm(groupId, 'manageJoinRequests') ||
+          resource.data.userId == request.auth.uid
+        );
+        allow create: if isSignedIn() && isValidId(userId)
+          && request.auth.uid == userId
+          && !isGroupBanned(groupId)
+          && incoming().userId == request.auth.uid
+          && incoming().status == 'pending';
+        allow update, delete: if isSignedIn() && isValidId(userId) && (
+          request.auth.uid == userId || hasGroupPerm(groupId, 'manageJoinRequests')
+        );
+      }
+
+      // Group & Chat Invitations
+      match /invitations/{inviteId} {
+        allow get: if isSignedIn() && isValidId(inviteId) && (
+          resource.data.inviteeId == request.auth.uid ||
+          resource.data.inviterId == request.auth.uid ||
+          hasGroupPerm(groupId, 'manageMembers')
+        );
+        allow list: if isSignedIn() && (
+          resource.data.inviteeId == request.auth.uid ||
+          resource.data.inviterId == request.auth.uid ||
+          hasGroupPerm(groupId, 'manageMembers')
+        );
+        allow create: if isSignedIn() && isValidId(inviteId)
+          && incoming().inviterId == request.auth.uid
+          && isGroupUnrestrictedMember(groupId);
+        allow update, delete: if isSignedIn() && isValidId(inviteId) && (
+          existing().inviteeId == request.auth.uid ||
+          existing().inviterId == request.auth.uid ||
+          hasGroupPerm(groupId, 'manageMembers')
+        );
+      }
+
+      // Custom Title History
+      match /titleHistory/{entryId} {
+        allow get, list: if canAccessGroupContent(groupId);
+        allow create: if isValidId(entryId) && hasGroupPerm(groupId, 'manageTitles');
+      }
+
+      // Group XP Transactions
+      match /xpTransactions/{txId} {
+        allow get, list: if canAccessGroupContent(groupId);
+        allow create: if isSignedIn() && isValidId(txId) && isGroupActiveMember(groupId) && (
+          hasGroupPerm(groupId, 'manageMembers') ||
+          hasGroupPerm(groupId, 'manageWiki') ||
+          hasGroupPerm(groupId, 'manageCompetitions') ||
+          (incoming().userId == request.auth.uid && incoming().amount is number && incoming().amount > 0 && incoming().amount <= 40)
+        );
+      }
+
+      // Group Posts (Posts, Galleries, Videos, Links, Polls, Quizzes, Questions)
+      match /posts/{postId} {
+        allow get, list: if canAccessGroupContent(groupId);
+        allow create: if isSignedIn() && isValidId(postId)
+          && incoming().authorId == request.auth.uid
+          && isGroupUnrestrictedMember(groupId)
+          && incoming().content is string && incoming().content.size() <= 4000;
+        allow update: if isSignedIn() && isValidId(postId) && !isGroupBanned(groupId) && (
+          hasGroupPerm(groupId, 'moderateContent') ||
+          hasGroupPerm(groupId, 'featurePosts') ||
+          (existing().authorId == request.auth.uid && isGroupUnrestrictedMember(groupId) && !incoming().diff(existing()).affectedKeys().hasAny(['id', 'authorId', 'groupId', 'createdAt', 'isFeatured', 'isHidden'])) ||
+          (
+            isGroupActiveMember(groupId) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'commentsCount', 'poll', 'quiz', 'updatedAt']) &&
+            validCounterDelta('likesCount') &&
+            validCounterDelta('commentsCount') &&
+            (!('poll' in incoming().diff(existing()).affectedKeys()) || (incoming().poll.question == existing().poll.question)) &&
+            (!('quiz' in incoming().diff(existing()).affectedKeys()) || (incoming().quiz.title == existing().quiz.title && incoming().quiz.questions == existing().quiz.questions))
+          )
+        );
+        allow delete: if isSignedIn() && isValidId(postId) && (
+          existing().authorId == request.auth.uid || hasGroupPerm(groupId, 'moderateContent')
+        );
+
+        match /comments/{commentId} {
+          allow get, list: if canAccessGroupContent(groupId);
+          allow create: if isSignedIn() && isValidId(commentId)
+            && incoming().authorId == request.auth.uid
+            && isGroupUnrestrictedMember(groupId)
+            && incoming().text is string && incoming().text.size() > 0 && incoming().text.size() <= 1500;
+          allow update: if isSignedIn() && isValidId(commentId) && !isGroupBanned(groupId) && (
+            existing().authorId == request.auth.uid ||
+            get(/databases/$(database)/documents/groups/$(groupId)/posts/$(postId)).data.authorId == request.auth.uid ||
+            hasGroupPerm(groupId, 'moderateContent')
+          );
+          allow delete: if isSignedIn() && isValidId(commentId) && (
+            existing().authorId == request.auth.uid || hasGroupPerm(groupId, 'moderateContent')
+          );
+        }
+
+        match /likes/{userId} {
+          allow get, list: if canAccessGroupContent(groupId);
+          allow create, delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isGroupActiveMember(groupId);
+        }
+
+        match /votes/{userId} {
+          allow get, list: if canAccessGroupContent(groupId);
+          allow create, update: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isGroupUnrestrictedMember(groupId);
+        }
+
+        match /attempts/{userId} {
+          allow get, list: if canAccessGroupContent(groupId);
+          allow create, update: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isGroupActiveMember(groupId);
+        }
+      }
+
+      // Group Announcements
+      match /announcements/{announcementId} {
+        allow get, list: if canAccessGroupContent(groupId);
+        allow create, update, delete: if isSignedIn() && isValidId(announcementId) && hasGroupPerm(groupId, 'publishAnnouncements');
+
+        match /reads/{userId} {
+          allow get, list: if canAccessGroupContent(groupId);
+          allow create, update: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isGroupActiveMember(groupId);
+        }
+      }
+
+      // Group Blogs
+      match /blogs/{blogId} {
+        allow get, list: if canAccessGroupContent(groupId);
+        allow create: if isSignedIn() && isValidId(blogId)
+          && incoming().authorId == request.auth.uid
+          && isGroupUnrestrictedMember(groupId)
+          && (groupDoc(groupId).blogPermission != 'staff_only' || hasGroupPerm(groupId, 'manageBlogs'));
+        allow update: if isSignedIn() && isValidId(blogId) && !isGroupBanned(groupId) && (
+          existing().authorId == request.auth.uid ||
+          hasGroupPerm(groupId, 'manageBlogs') ||
+          hasGroupPerm(groupId, 'moderateContent') ||
+          (isGroupActiveMember(groupId) && incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'commentsCount']))
+        );
+        allow delete: if isSignedIn() && isValidId(blogId) && (
+          existing().authorId == request.auth.uid || hasGroupPerm(groupId, 'manageBlogs') || hasGroupPerm(groupId, 'moderateContent')
+        );
+
+        match /comments/{commentId} {
+          allow get, list: if canAccessGroupContent(groupId);
+          allow create: if isSignedIn() && isValidId(commentId) && incoming().authorId == request.auth.uid && isGroupUnrestrictedMember(groupId);
+          allow delete: if isSignedIn() && isValidId(commentId) && (existing().authorId == request.auth.uid || hasGroupPerm(groupId, 'manageBlogs'));
+        }
+
+        match /reactions/{userId} {
+          allow get, list: if canAccessGroupContent(groupId);
+          allow create, delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isGroupActiveMember(groupId);
+        }
+
+        match /bookmarks/{userId} {
+          allow get, list: if isSignedIn() && request.auth.uid == userId;
+          allow create, delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isGroupActiveMember(groupId);
+        }
+      }
+
+      // Group Wiki & Revisions
+      match /wiki/{entryId} {
+        allow get, list: if canAccessGroupContent(groupId);
+        allow create: if isSignedIn() && isValidId(entryId)
+          && incoming().authorId == request.auth.uid
+          && isGroupUnrestrictedMember(groupId)
+          && (groupDoc(groupId).wikiPermission != 'staff_only' || hasGroupPerm(groupId, 'manageWiki'));
+        allow update: if isSignedIn() && isValidId(entryId) && !isGroupBanned(groupId) && (
+          hasGroupPerm(groupId, 'manageWiki') ||
+          (existing().authorId == request.auth.uid && isGroupUnrestrictedMember(groupId) && incoming().status in ['draft', 'pending_review']) ||
+          (isGroupUnrestrictedMember(groupId) && existing().status == 'approved' && !incoming().diff(existing()).affectedKeys().hasAny(['isFeatured', 'authorId', 'createdAt']))
+        );
+        allow delete: if isSignedIn() && isValidId(entryId) && (
+          existing().authorId == request.auth.uid || hasGroupPerm(groupId, 'manageWiki')
+        );
+
+        match /revisions/{revisionId} {
+          allow get, list: if canAccessGroupContent(groupId);
+          allow create: if isSignedIn() && isValidId(revisionId) && incoming().editorId == request.auth.uid && isGroupUnrestrictedMember(groupId);
+        }
+      }
+
+      // Group Public & Private Chat Rooms
+      match /chatRooms/{roomId} {
+        allow get: if isValidId(roomId) && !isGroupBanned(groupId) && (
+          (resource.data.type == 'public' && canAccessGroupContent(groupId)) ||
+          (resource.data.type == 'topic' && canAccessGroupContent(groupId)) ||
+          (resource.data.type == 'event' && canAccessGroupContent(groupId)) ||
+          (resource.data.type == 'staff' && isGroupStaff(groupId)) ||
+          (resource.data.type == 'private' && isGroupActiveMember(groupId) && (
+            request.auth.uid in resource.data.invitedUserIds ||
+            resource.data.ownerId == request.auth.uid ||
+            request.auth.uid in resource.data.moderatorIds ||
+            hasGroupPerm(groupId, 'manageChats')
+          ))
+        );
+        allow list: if !isGroupBanned(groupId) && (
+          (resource.data.type in ['public', 'topic', 'event'] && canAccessGroupContent(groupId)) ||
+          (resource.data.type == 'staff' && isGroupStaff(groupId)) ||
+          (resource.data.type == 'private' && isSignedIn() && (
+            request.auth.uid in resource.data.invitedUserIds ||
+            resource.data.ownerId == request.auth.uid ||
+            request.auth.uid in resource.data.moderatorIds ||
+            hasGroupPerm(groupId, 'manageChats')
+          ))
+        );
+        allow create: if isSignedIn() && isValidId(roomId)
+          && incoming().ownerId == request.auth.uid
+          && isGroupUnrestrictedMember(groupId)
+          && (incoming().type in ['public', 'topic', 'event', 'private'] || hasGroupPerm(groupId, 'manageChats'));
+        allow update: if isSignedIn() && isValidId(roomId) && !isGroupBanned(groupId) && (
+          existing().ownerId == request.auth.uid ||
+          request.auth.uid in existing().moderatorIds ||
+          hasGroupPerm(groupId, 'manageChats') ||
+          (isGroupActiveMember(groupId) && incoming().diff(existing()).affectedKeys().hasOnly(['memberCount', 'activeCount', 'lastMessageText', 'lastMessageAt']))
+        );
+        allow delete: if isSignedIn() && isValidId(roomId) && (
+          existing().ownerId == request.auth.uid || hasGroupPerm(groupId, 'manageChats')
+        );
+
+        match /participants/{userId} {
+          allow get: if isValidId(userId) && canAccessChatRoom(groupId, roomId);
+          allow list: if canAccessChatRoom(groupId, roomId);
+          allow create, update: if isSignedIn() && isValidId(userId) && !isGroupBanned(groupId) && (
+            (request.auth.uid == userId && isGroupActiveMember(groupId) && canAccessChatRoom(groupId, roomId)) ||
+            hasGroupPerm(groupId, 'manageChats')
+          );
+          allow delete: if isSignedIn() && isValidId(userId) && (
+            request.auth.uid == userId || hasGroupPerm(groupId, 'manageChats')
+          );
+        }
+
+        match /messages/{messageId} {
+          allow get: if isValidId(messageId) && canAccessChatRoom(groupId, roomId);
+          allow list: if canAccessChatRoom(groupId, roomId);
+          allow create: if isSignedIn() && isValidId(messageId)
+            && incoming().senderId == request.auth.uid
+            && isGroupUnrestrictedMember(groupId)
+            && canAccessChatRoom(groupId, roomId)
+            && !(request.auth.uid in chatRoomDoc(groupId, roomId).restrictedUserIds)
+            && (chatRoomDoc(groupId, roomId).isReadOnly != true || isGroupStaff(groupId) || chatRoomDoc(groupId, roomId).ownerId == request.auth.uid);
+          allow update: if isSignedIn() && isValidId(messageId) && !isGroupBanned(groupId) && (
+            existing().senderId == request.auth.uid ||
+            hasGroupPerm(groupId, 'manageChats') ||
+            (isGroupActiveMember(groupId) && canAccessChatRoom(groupId, roomId) && incoming().diff(existing()).affectedKeys().hasOnly(['reactions']))
+          );
+          allow delete: if isSignedIn() && isValidId(messageId) && (
+            existing().senderId == request.auth.uid || hasGroupPerm(groupId, 'manageChats')
+          );
+        }
+      }
+
+      // Group Live Voice Rooms, Video Sessions & Broadcasts
+      match /liveSessions/{sessionId} {
+        allow get, list: if !isGroupBanned(groupId) && canAccessGroupContent(groupId);
+        allow create: if isSignedIn() && isValidId(sessionId)
+          && incoming().hostId == request.auth.uid
+          && isGroupUnrestrictedMember(groupId)
+          && (incoming().mode in ['voice', 'video'] || hasGroupPerm(groupId, 'manageLiveSessions'));
+        allow update: if isSignedIn() && isValidId(sessionId) && !isGroupBanned(groupId) && (
+          existing().hostId == request.auth.uid ||
+          hasGroupPerm(groupId, 'manageLiveSessions') ||
+          (isGroupActiveMember(groupId) && incoming().diff(existing()).affectedKeys().hasOnly(['participantCount']))
+        );
+        allow delete: if isSignedIn() && isValidId(sessionId) && (
+          existing().hostId == request.auth.uid || hasGroupPerm(groupId, 'manageLiveSessions')
+        );
+
+        match /participants/{userId} {
+          allow get, list: if !isGroupBanned(groupId) && canAccessGroupContent(groupId);
+          allow create, update: if isSignedIn() && isValidId(userId) && !isGroupBanned(groupId) && (
+            (request.auth.uid == userId && isGroupActiveMember(groupId)) ||
+            get(/databases/$(database)/documents/groups/$(groupId)/liveSessions/$(sessionId)).data.hostId == request.auth.uid ||
+            hasGroupPerm(groupId, 'manageLiveSessions')
+          );
+          allow delete: if isSignedIn() && isValidId(userId) && (
+            request.auth.uid == userId ||
+            get(/databases/$(database)/documents/groups/$(groupId)/liveSessions/$(sessionId)).data.hostId == request.auth.uid ||
+            hasGroupPerm(groupId, 'manageLiveSessions')
+          );
+        }
+
+        match /signals/{signalId} {
+          allow get, list: if isSignedIn() && !isGroupBanned(groupId) && isGroupActiveMember(groupId);
+          allow create: if isSignedIn() && isValidId(signalId) && incoming().fromUserId == request.auth.uid && isGroupActiveMember(groupId);
+          allow delete: if isSignedIn() && isValidId(signalId) && (
+            resource.data.fromUserId == request.auth.uid ||
+            resource.data.toUserId == request.auth.uid ||
+            hasGroupPerm(groupId, 'manageLiveSessions')
+          );
+        }
+
+        match /comments/{commentId} {
+          allow get, list: if !isGroupBanned(groupId) && canAccessGroupContent(groupId);
+          allow create: if isSignedIn() && isValidId(commentId) && incoming().userId == request.auth.uid && isGroupUnrestrictedMember(groupId);
+          allow delete: if isSignedIn() && isValidId(commentId) && (existing().userId == request.auth.uid || hasGroupPerm(groupId, 'manageLiveSessions'));
+        }
+      }
+
+      // Group Events
+      match /events/{eventId} {
+        allow get, list: if canAccessGroupContent(groupId);
+        allow create: if isSignedIn() && isValidId(eventId)
+          && incoming().creatorId == request.auth.uid
+          && (hasGroupPerm(groupId, 'manageEvents') || isGroupUnrestrictedMember(groupId));
+        allow update: if isSignedIn() && isValidId(eventId) && !isGroupBanned(groupId) && (
+          existing().creatorId == request.auth.uid ||
+          hasGroupPerm(groupId, 'manageEvents') ||
+          (isGroupActiveMember(groupId) && incoming().diff(existing()).affectedKeys().hasOnly(['participantsCount']))
+        );
+        allow delete: if isSignedIn() && isValidId(eventId) && (
+          existing().creatorId == request.auth.uid || hasGroupPerm(groupId, 'manageEvents')
+        );
+
+        match /rsvps/{userId} {
+          allow get, list: if canAccessGroupContent(groupId);
+          allow create, update, delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isGroupActiveMember(groupId);
+        }
+      }
+
+      // Group Competitions
+      match /competitions/{compId} {
+        allow get, list: if canAccessGroupContent(groupId);
+        allow create: if isSignedIn() && isValidId(compId)
+          && incoming().creatorId == request.auth.uid
+          && hasGroupPerm(groupId, 'manageCompetitions');
+        allow update: if isSignedIn() && isValidId(compId) && !isGroupBanned(groupId) && (
+          existing().creatorId == request.auth.uid ||
+          hasGroupPerm(groupId, 'manageCompetitions') ||
+          (isGroupActiveMember(groupId) && incoming().diff(existing()).affectedKeys().hasOnly(['submissionsCount']))
+        );
+        allow delete: if isSignedIn() && isValidId(compId) && (
+          existing().creatorId == request.auth.uid || hasGroupPerm(groupId, 'manageCompetitions')
+        );
+
+        match /submissions/{submissionId} {
+          allow get, list: if canAccessGroupContent(groupId);
+          allow create: if isSignedIn() && isValidId(submissionId)
+            && incoming().userId == request.auth.uid
+            && isGroupUnrestrictedMember(groupId);
+          allow update: if isSignedIn() && isValidId(submissionId) && !isGroupBanned(groupId) && (
+            existing().userId == request.auth.uid ||
+            hasGroupPerm(groupId, 'manageCompetitions') ||
+            request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)/competitions/$(compId)).data.judgeIds ||
+            (isGroupActiveMember(groupId) && incoming().diff(existing()).affectedKeys().hasOnly(['votesCount']))
+          );
+          allow delete: if isSignedIn() && isValidId(submissionId) && (
+            existing().userId == request.auth.uid || hasGroupPerm(groupId, 'manageCompetitions')
+          );
+
+          match /votes/{userId} {
+            allow get, list: if canAccessGroupContent(groupId);
+            allow create, delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isGroupUnrestrictedMember(groupId);
+          }
+        }
+      }
+
+      // Group Moderation Logs (Immutable Staff Audit Trail)
+      match /moderationLogs/{logId} {
+        allow get, list: if isGroupStaff(groupId);
+        allow create: if isSignedIn() && isValidId(logId) && incoming().actorId == request.auth.uid && isGroupStaff(groupId);
+        allow update, delete: if false;
+      }
     }
   }
 }

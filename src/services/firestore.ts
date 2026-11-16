@@ -1,5 +1,6 @@
 import {
   collection,
+  collectionGroup,
   doc,
   getDoc,
   getDocs,
@@ -14,9 +15,10 @@ import {
   increment,
   arrayUnion,
   arrayRemove,
+  runTransaction,
   Unsubscribe
 } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../firebase/config';
+import { auth, db, handleFirestoreError, OperationType } from '../firebase/config';
 import {
   UserProfile,
   Post,
@@ -32,8 +34,36 @@ import {
   AuditLog,
   ModerationAppeal,
   UserCustomization,
-  UserRole
+  UserRole,
+  AdminVerificationNote,
+  BookmarkRecord,
+  VerificationStatus,
+  MediaMetadata,
+  CommunityEvent,
+  CustomTitle,
+  CustomTitlePreset,
+  XpLogEntry,
+  ChatRoom,
+  ChatRoomMember,
+  ChatRoomMessage,
+  StoryViewerRecord,
+  GlobalAdminRole,
+  GlobalPermissionKey,
+  PlatformAnnouncement,
+  PlatformAd,
+  ModerationReport
 } from '../types';
+import { deleteMediaFromStorage } from './storage';
+
+function stripUndefined<T extends Record<string, any>>(obj: T): T {
+  const result: Record<string, any> = {};
+  Object.entries(obj).forEach(([k, v]) => {
+    if (v !== undefined) {
+      result[k] = v;
+    }
+  });
+  return result as T;
+}
 
 /* =========================================================================
    USER PROFILES & PII ISOLATION
@@ -71,11 +101,12 @@ export async function syncUserProfile(
         id: user.uid,
         displayName: user.displayName || 'Distinguished Member',
         handle: fallbackHandle,
-        photoURL: user.photoURL || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(rawName)}`,
-        bannerURL: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?auto=format&fit=crop&w=1600&q=80',
+        photoURL: user.photoURL || '',
+        bannerURL: '',
         bio: '',
         role: assignedRole,
         isVerified: Boolean(isAdminEmail || assignedRole === 'owner' || assignedRole === 'admin'),
+        verificationStatus: (isAdminEmail || assignedRole === 'owner' || assignedRole === 'admin') ? 'verified' : 'not_verified',
         level: 0,
         xp: 0,
         isSpecial: false,
@@ -229,18 +260,39 @@ export function listenToPosts(callback: (posts: Post[]) => void): Unsubscribe {
   );
 }
 
+export function listenToPost(postId: string, callback: (post: Post | null) => void): Unsubscribe {
+  return onSnapshot(
+    doc(db, 'posts', postId),
+    (snap) => {
+      callback(snap.exists() ? ({ id: snap.id, ...snap.data() } as Post) : null);
+    },
+    () => callback(null)
+  );
+}
+
+export async function getPostById(postId: string): Promise<Post | null> {
+  const path = `posts/${postId}`;
+  try {
+    const snap = await getDoc(doc(db, 'posts', postId));
+    return snap.exists() ? ({ id: snap.id, ...snap.data() } as Post) : null;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+}
+
 export async function createPost(post: Omit<Post, 'id' | 'likesCount' | 'commentsCount'>): Promise<string> {
   const postId = `post_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const path = `posts/${postId}`;
   try {
-    const newPost: Post = {
+    const newPost: Post = stripUndefined({
       ...post,
       id: postId,
+      postType: post.postType || 'post',
       likesCount: 0,
       commentsCount: 0,
       sharesCount: 0,
       bookmarksCount: 0,
-    };
+    });
     await setDoc(doc(db, 'posts', postId), newPost);
 
     // Increment author's post count
@@ -248,9 +300,193 @@ export async function createPost(post: Omit<Post, 'id' | 'likesCount' | 'comment
       postsCount: increment(1),
     }).catch(() => {});
 
+    void awardUserXp('post_create');
+
     return postId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function repostPost(
+  originalPost: Post,
+  actor: UserProfile,
+  quoteText?: string
+): Promise<string> {
+  const postId = `post_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const path = `posts/${postId}`;
+  try {
+    const newPost: Post = stripUndefined({
+      id: postId,
+      authorId: actor.id,
+      authorName: actor.displayName,
+      authorHandle: actor.handle,
+      authorPhotoURL: actor.photoURL || '',
+      authorRole: actor.role,
+      authorCustomTitle: actor.customTitle || null,
+      authorCustomTitles: actor.customTitles || (actor.customTitle ? [actor.customTitle] : []),
+      authorIsVerified: actor.isVerified,
+      authorVerificationCategory: actor.verificationCategory,
+      authorLevel: actor.level,
+      postType: 'repost',
+      visibility: 'public',
+      content: quoteText?.trim() || '',
+      repostOf: stripUndefined({
+        id: originalPost.id,
+        authorId: originalPost.authorId,
+        authorName: originalPost.authorName,
+        authorHandle: originalPost.authorHandle,
+        authorPhotoURL: originalPost.authorPhotoURL || '',
+        authorIsVerified: originalPost.authorIsVerified,
+        authorVerificationCategory: originalPost.authorVerificationCategory,
+        content: originalPost.content,
+        title: originalPost.title,
+        mediaURL: originalPost.mediaURL,
+        mediaURLs: originalPost.mediaURLs,
+        createdAt: originalPost.createdAt,
+      }),
+      likesCount: 0,
+      commentsCount: 0,
+      repostsCount: 0,
+      sharesCount: 0,
+      bookmarksCount: 0,
+      createdAt: new Date().toISOString(),
+    });
+
+    await setDoc(doc(db, 'posts', postId), newPost);
+    await updateDoc(doc(db, 'posts', originalPost.id), {
+      repostsCount: increment(1),
+    }).catch(() => {});
+    await updateDoc(doc(db, 'users', actor.id), {
+      postsCount: increment(1),
+    }).catch(() => {});
+
+    if (originalPost.authorId !== actor.id) {
+      await createNotification({
+        recipientId: originalPost.authorId,
+        senderId: actor.id,
+        senderName: actor.displayName,
+        senderPhotoURL: actor.photoURL,
+        type: 'repost',
+        targetId: postId,
+        message: quoteText?.trim()
+          ? `اقتبس منشورك: "${quoteText.trim().slice(0, 45)}"`
+          : 'أعاد نشر منشورك.',
+      });
+    }
+
+    void awardUserXp('repost_create');
+    return postId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function getUserGlobalPollVote(postId: string, userId: string): Promise<string[]> {
+  try {
+    const snap = await getDoc(doc(db, 'posts', postId, 'votes', userId));
+    if (!snap.exists()) return [];
+    const data = snap.data() as { optionIds?: string[] };
+    return Array.isArray(data.optionIds) ? data.optionIds : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function voteOnGlobalPoll(
+  postId: string,
+  userId: string,
+  selectedOptionIds: string[]
+): Promise<void> {
+  const path = `posts/${postId}/votes/${userId}`;
+  try {
+    await runTransaction(db, async (tx) => {
+      const postRef = doc(db, 'posts', postId);
+      const voteRef = doc(db, 'posts', postId, 'votes', userId);
+      const [postSnap, voteSnap] = await Promise.all([tx.get(postRef), tx.get(voteRef)]);
+      if (!postSnap.exists()) throw new Error('المنشور غير موجود');
+      const postData = postSnap.data() as Post;
+      if (!postData.poll) throw new Error('لا يوجد استطلاع في هذا المنشور');
+
+      const prevSelected: string[] = voteSnap.exists()
+        ? ((voteSnap.data() as { optionIds?: string[] }).optionIds || [])
+        : [];
+      const nextSelected = postData.poll.allowMultiple
+        ? Array.from(new Set(selectedOptionIds))
+        : selectedOptionIds.slice(0, 1);
+
+      const updatedOptions = postData.poll.options.map((opt) => {
+        const wasVoted = prevSelected.includes(opt.id);
+        const isVoted = nextSelected.includes(opt.id);
+        let delta = 0;
+        if (!wasVoted && isVoted) delta = 1;
+        if (wasVoted && !isVoted) delta = -1;
+        return {
+          ...opt,
+          votesCount: Math.max(0, (opt.votesCount || 0) + delta),
+        };
+      });
+
+      const hadAnyPrev = prevSelected.length > 0;
+      const hasAnyNext = nextSelected.length > 0;
+      const totalDelta = !hadAnyPrev && hasAnyNext ? 1 : hadAnyPrev && !hasAnyNext ? -1 : 0;
+
+      tx.set(voteRef, {
+        userId,
+        optionIds: nextSelected,
+        updatedAt: new Date().toISOString(),
+      });
+      tx.update(postRef, {
+        poll: {
+          ...postData.poll,
+          options: updatedOptions,
+          totalVotes: Math.max(0, (postData.poll.totalVotes || 0) + totalDelta),
+        },
+      });
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function submitGlobalQuizAttempt(
+  postId: string,
+  userId: string,
+  score: number,
+  total: number
+): Promise<void> {
+  const path = `posts/${postId}/attempts/${userId}`;
+  try {
+    await setDoc(doc(db, 'posts', postId, 'attempts', userId), {
+      userId,
+      score,
+      total,
+      completedAt: new Date().toISOString(),
+    });
+    await updateDoc(doc(db, 'posts', postId), {
+      'quiz.attemptsCount': increment(1),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function toggleBestAnswerComment(
+  postId: string,
+  commentId: string,
+  isBest: boolean
+): Promise<void> {
+  const path = `posts/${postId}`;
+  try {
+    await updateDoc(doc(db, 'posts', postId), {
+      bestAnswerCommentId: isBest ? commentId : '',
+      updatedAt: new Date().toISOString(),
+    });
+    await updateDoc(doc(db, 'posts', postId, 'comments', commentId), {
+      isBestAnswer: isBest,
+    }).catch(() => {});
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
   }
 }
 
@@ -266,13 +502,92 @@ export async function updatePostContent(postId: string, content: string): Promis
   }
 }
 
+export async function updateWikiPost(
+  postId: string,
+  data: { title?: string; content: string; tags?: string[] },
+  editor: UserProfile
+): Promise<void> {
+  const path = `posts/${postId}`;
+  try {
+    const now = new Date().toISOString();
+    await updateDoc(doc(db, 'posts', postId), stripUndefined({
+      title: data.title !== undefined ? data.title.trim().slice(0, 200) : undefined,
+      content: data.content.trim().slice(0, 10000),
+      tags: data.tags,
+      editedAt: now,
+      editedBy: editor.id,
+      editedByName: editor.displayName,
+      updatedAt: now,
+    }));
+
+    await recordAuditLog({
+      actorId: editor.id,
+      actorName: editor.displayName,
+      actorRole: editor.role,
+      actionType: 'wiki_edit',
+      targetType: 'post',
+      targetId: postId,
+      targetDetails: `Edited wiki article "${data.title || postId}"`,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function incrementPostShare(postId: string): Promise<void> {
+  const path = `posts/${postId}`;
+  try {
+    await updateDoc(doc(db, 'posts', postId), {
+      sharesCount: increment(1),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function togglePostPinned(postId: string, userId: string, isPinned: boolean): Promise<void> {
+  const path = `posts/${postId}`;
+  try {
+    await updateDoc(doc(db, 'posts', postId), {
+      isPinned,
+      updatedAt: new Date().toISOString(),
+    });
+    await updateDoc(doc(db, 'users', userId), {
+      'customization.pinnedPostId': isPinned ? postId : '',
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
 export async function deletePost(postId: string, authorId: string): Promise<void> {
   const path = `posts/${postId}`;
   try {
+    let mediaUrls: string[] = [];
+    let mediaPaths: string[] = [];
+    try {
+      const existingSnap = await getDoc(doc(db, 'posts', postId));
+      if (existingSnap.exists()) {
+        const postData = existingSnap.data() as Post;
+        mediaUrls = [
+          ...(postData.mediaURL ? [postData.mediaURL] : []),
+          ...(Array.isArray(postData.mediaURLs) ? postData.mediaURLs : []),
+          ...(postData.videoURL ? [postData.videoURL] : []),
+        ];
+        mediaPaths = (postData.mediaMetadata || []).map((m) => m.path).filter(Boolean);
+      }
+    } catch {
+      // Proceed with Firestore post delete even if pre-read fails
+    }
+
     await deleteDoc(doc(db, 'posts', postId));
     await updateDoc(doc(db, 'users', authorId), {
       postsCount: increment(-1),
     }).catch(() => {});
+
+    if (mediaUrls.length > 0 || mediaPaths.length > 0) {
+      deleteMediaFromStorage({ urls: mediaUrls, paths: mediaPaths }).catch(() => {});
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -333,6 +648,7 @@ export async function togglePostLike(
           message: 'liked your post.',
         });
       }
+      void awardUserXp('like_given');
       return true;
     }
   } catch (error) {
@@ -388,6 +704,28 @@ export async function toggleBookmark(
   }
 }
 
+export function listenToUserBookmarks(
+  userId: string,
+  callback: (bookmarks: BookmarkRecord[]) => void
+): Unsubscribe {
+  const path = `users/${userId}/bookmarks`;
+  const q = query(collection(db, 'users', userId, 'bookmarks'), orderBy('savedAt', 'desc'));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const items: BookmarkRecord[] = [];
+      snapshot.forEach((docSnap) => {
+        items.push(docSnap.data() as BookmarkRecord);
+      });
+      callback(items);
+    },
+    (error) => {
+      callback([]);
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
+  );
+}
+
 export async function deleteUserProfile(userId: string): Promise<void> {
   const path = `users/${userId}`;
   try {
@@ -423,23 +761,35 @@ export function listenToComments(postId: string, callback: (comments: Comment[])
 
 export async function addComment(
   postId: string,
-  author: { id: string; name: string; handle: string; photoURL?: string },
+  author: {
+    id: string;
+    name: string;
+    handle: string;
+    photoURL?: string;
+    isVerified?: boolean;
+    verificationCategory?: VerificationCategory;
+  },
   text: string,
-  postAuthorId: string
+  postAuthorId: string,
+  parent?: { parentCommentId?: string; replyToAuthorName?: string }
 ): Promise<string> {
   const commentId = `cmt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   const path = `posts/${postId}/comments/${commentId}`;
   try {
-    const comment: Comment = {
+    const comment: Comment = stripUndefined({
       id: commentId,
       postId,
       authorId: author.id,
       authorName: author.name,
       authorHandle: author.handle,
-      authorPhotoURL: author.photoURL,
+      authorPhotoURL: author.photoURL || '',
+      authorIsVerified: Boolean(author.isVerified),
+      authorVerificationCategory: author.verificationCategory || 'blue',
       text,
+      parentCommentId: parent?.parentCommentId || undefined,
+      replyToAuthorName: parent?.replyToAuthorName || undefined,
       createdAt: new Date().toISOString(),
-    };
+    });
 
     await setDoc(doc(db, 'posts', postId, 'comments', commentId), comment);
     await updateDoc(doc(db, 'posts', postId), {
@@ -458,10 +808,35 @@ export async function addComment(
       });
     }
 
+    void awardUserXp('comment_create');
     return commentId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
   }
+}
+
+export function listenToUserReplies(
+  userId: string,
+  callback: (replies: Comment[]) => void
+): Unsubscribe {
+  const q = query(
+    collectionGroup(db, 'comments'),
+    where('authorId', '==', userId),
+    limit(50)
+  );
+  return onSnapshot(
+    q,
+    (snap) => {
+      const items: Comment[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as Comment;
+        if (data.postId && data.text) items.push(data);
+      });
+      items.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      callback(items);
+    },
+    () => callback([])
+  );
 }
 
 export async function deleteComment(postId: string, commentId: string): Promise<void> {
@@ -583,33 +958,120 @@ export function listenToUserFollowing(
   );
 }
 
+export function listenToFollowersProfiles(
+  userId: string,
+  callback: (profiles: UserProfile[]) => void
+): Unsubscribe {
+  return listenToUserFollowers(userId, (rels) => {
+    const ids = Array.from(new Set(rels.map((r) => r.followerId).filter(Boolean))).slice(0, 60);
+    if (ids.length === 0) {
+      callback([]);
+      return;
+    }
+    Promise.all(ids.map((id) => getUserProfile(id).catch(() => null)))
+      .then((res) => callback(res.filter((u): u is UserProfile => Boolean(u))))
+      .catch(() => callback([]));
+  });
+}
+
+export function listenToFollowingProfiles(
+  userId: string,
+  callback: (profiles: UserProfile[]) => void
+): Unsubscribe {
+  return listenToUserFollowing(userId, (rels) => {
+    const ids = Array.from(new Set(rels.map((r) => r.followingId).filter(Boolean))).slice(0, 60);
+    if (ids.length === 0) {
+      callback([]);
+      return;
+    }
+    Promise.all(ids.map((id) => getUserProfile(id).catch(() => null)))
+      .then((res) => callback(res.filter((u): u is UserProfile => Boolean(u))))
+      .catch(() => callback([]));
+  });
+}
+
 /* =========================================================================
-   STORIES (WITH 24H EXPIRATION & VIEWER REGISTRATION)
+   STORIES (FOLLOWERS-ONLY VISIBILITY & ISOLATED VIEWER RECORDS)
    ========================================================================= */
 
-export function listenToStories(callback: (stories: Story[]) => void): Unsubscribe {
-  const path = 'stories';
-  const q = query(collection(db, 'stories'), orderBy('createdAt', 'desc'));
+export function listenToStories(
+  currentUserIdOrCallback: string | null | undefined | ((stories: Story[]) => void),
+  maybeCallback?: (stories: Story[]) => void
+): Unsubscribe {
+  const currentUserId = typeof currentUserIdOrCallback === 'string' ? currentUserIdOrCallback : null;
+  const callback = typeof currentUserIdOrCallback === 'function' ? currentUserIdOrCallback : (maybeCallback || (() => {}));
 
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const now = new Date().toISOString();
-      const stories: Story[] = [];
-      snapshot.forEach((docSnap) => {
-        const story = { id: docSnap.id, ...docSnap.data() } as Story;
-        // Filter out expired stories (over 24h old)
-        if (story.expiresAt > now) {
-          stories.push(story);
+  if (!currentUserId) {
+    callback([]);
+    return () => {};
+  }
+
+  let storyUnsubs: Unsubscribe[] = [];
+  const chunkStoriesMap = new Map<number, Story[]>();
+
+  const emitMerged = () => {
+    const now = new Date().toISOString();
+    const byId = new Map<string, Story>();
+    chunkStoriesMap.forEach((list) => {
+      list.forEach((s) => {
+        if (s.expiresAt > now) {
+          byId.set(s.id, s);
         }
       });
-      callback(stories);
+    });
+    const merged = Array.from(byId.values()).sort((a, b) =>
+      (b.createdAt || '').localeCompare(a.createdAt || '')
+    );
+    callback(merged);
+  };
+
+  const followsQuery = query(collection(db, 'follows'), where('followerId', '==', currentUserId));
+  const followUnsub = onSnapshot(
+    followsQuery,
+    (followSnap) => {
+      storyUnsubs.forEach((u) => u());
+      storyUnsubs = [];
+      chunkStoriesMap.clear();
+
+      const authorIds = new Set<string>([currentUserId]);
+      followSnap.forEach((d) => {
+        const rel = d.data() as FollowRelationship;
+        if (rel.followingId) authorIds.add(rel.followingId);
+      });
+
+      const allAuthors = Array.from(authorIds);
+      const chunks: string[][] = [];
+      for (let i = 0; i < allAuthors.length; i += 25) {
+        chunks.push(allAuthors.slice(i, i + 25));
+      }
+
+      chunks.forEach((chunk, idx) => {
+        const sq = query(collection(db, 'stories'), where('authorId', 'in', chunk));
+        const unsub = onSnapshot(
+          sq,
+          (snap) => {
+            const list: Story[] = [];
+            snap.forEach((docSnap) => {
+              list.push({ id: docSnap.id, ...docSnap.data() } as Story);
+            });
+            chunkStoriesMap.set(idx, list);
+            emitMerged();
+          },
+          () => {
+            chunkStoriesMap.set(idx, []);
+            emitMerged();
+          }
+        );
+        storyUnsubs.push(unsub);
+      });
     },
-    (error) => {
-      callback([]);
-      handleFirestoreError(error, OperationType.LIST, path);
-    }
+    () => callback([])
   );
+
+  return () => {
+    followUnsub();
+    storyUnsubs.forEach((u) => u());
+  };
 }
 
 export async function createStory(story: {
@@ -617,7 +1079,20 @@ export async function createStory(story: {
   authorName: string;
   authorHandle?: string;
   authorPhotoURL?: string;
+  authorIsVerified?: boolean;
+  authorVerificationCategory?: VerificationCategory;
   mediaURL: string;
+  mediaType?: 'image' | 'video';
+  mediaPath?: string;
+  mediaMetadata?: MediaMetadata;
+  mediaScale?: number;
+  mediaOffsetX?: number;
+  mediaOffsetY?: number;
+  overlayText?: string;
+  textColor?: string;
+  bgStyle?: string;
+  textPosition?: 'top' | 'center' | 'bottom';
+  durationSec?: number;
   caption?: string;
 }): Promise<string> {
   const storyId = `story_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
@@ -626,13 +1101,14 @@ export async function createStory(story: {
     const now = new Date();
     const expires = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
-    const newStory: Story = {
+    const newStory: Story = stripUndefined({
       ...story,
       id: storyId,
-      viewers: [],
+      visibility: 'followers',
+      viewCount: 0,
       createdAt: now.toISOString(),
       expiresAt: expires.toISOString(),
-    };
+    });
 
     await setDoc(doc(db, 'stories', storyId), newStory);
     return storyId;
@@ -641,22 +1117,81 @@ export async function createStory(story: {
   }
 }
 
-export async function recordStoryView(storyId: string, viewerId: string): Promise<void> {
-  const path = `stories/${storyId}`;
+export async function recordStoryView(
+  storyId: string,
+  viewer: string | { id: string; displayName?: string; handle?: string; photoURL?: string }
+): Promise<void> {
+  const viewerObj = typeof viewer === 'string' ? { id: viewer } : viewer;
+  if (!viewerObj?.id) return;
   try {
+    const viewerRef = doc(db, 'stories', storyId, 'viewers', viewerObj.id);
+    const existing = await getDoc(viewerRef).catch(() => null);
+    if (existing?.exists()) return;
+
+    await setDoc(viewerRef, stripUndefined({
+      viewerId: viewerObj.id,
+      displayName: viewerObj.displayName || '',
+      handle: viewerObj.handle || '',
+      photoURL: viewerObj.photoURL || '',
+      viewedAt: new Date().toISOString(),
+    }));
     await updateDoc(doc(db, 'stories', storyId), {
-      viewers: arrayUnion(viewerId),
-    });
+      viewCount: increment(1),
+    }).catch(() => {});
   } catch (error) {
-    // Non-blocking
     console.error('Failed to record story view:', error);
   }
+}
+
+export async function hasViewedStory(storyId: string, userId: string): Promise<boolean> {
+  try {
+    const snap = await getDoc(doc(db, 'stories', storyId, 'viewers', userId));
+    return snap.exists();
+  } catch {
+    return false;
+  }
+}
+
+export function listenToStoryViewers(
+  storyId: string,
+  callback: (viewers: StoryViewerRecord[]) => void
+): Unsubscribe {
+  const q = query(collection(db, 'stories', storyId, 'viewers'), orderBy('viewedAt', 'desc'), limit(100));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const items: StoryViewerRecord[] = [];
+      snap.forEach((d) => items.push(d.data() as StoryViewerRecord));
+      callback(items);
+    },
+    () => callback([])
+  );
 }
 
 export async function deleteStory(storyId: string): Promise<void> {
   const path = `stories/${storyId}`;
   try {
+    let mediaUrl = '';
+    let mediaPath = '';
+    try {
+      const existingSnap = await getDoc(doc(db, 'stories', storyId));
+      if (existingSnap.exists()) {
+        const storyData = existingSnap.data() as Story;
+        mediaUrl = storyData.mediaURL || '';
+        mediaPath = storyData.mediaPath || storyData.mediaMetadata?.path || '';
+      }
+    } catch {
+      // Proceed with Firestore story delete
+    }
+
     await deleteDoc(doc(db, 'stories', storyId));
+
+    if (mediaUrl || mediaPath) {
+      deleteMediaFromStorage({
+        urls: mediaUrl ? [mediaUrl] : [],
+        paths: mediaPath ? [mediaPath] : [],
+      }).catch(() => {});
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -735,12 +1270,23 @@ export async function getOrCreateConversation(
     let existingId: string | null = null;
     snap.forEach((docSnap) => {
       const data = docSnap.data() as Conversation;
-      if (data.participantIds.includes(targetUser.id)) {
+      if (!data.isGroup && data.participantIds.includes(targetUser.id)) {
         existingId = docSnap.id;
       }
     });
 
     if (existingId) return existingId;
+
+    if (
+      targetUser.customization?.privacy?.directMessages === 'followers_only' &&
+      currentUser.role !== 'admin' &&
+      currentUser.role !== 'owner'
+    ) {
+      const followsTarget = await checkIsFollowing(currentUser.id, targetUser.id);
+      if (!followsTarget) {
+        throw new Error('لا يمكنك بدء محادثة خاصة لأن هذا المستخدم يقتصر الرسائل على المتابعين فقط.');
+      }
+    }
 
     // Create new conversation
     const convId = `conv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
@@ -764,6 +1310,7 @@ export async function getOrCreateConversation(
       lastMessageText: '',
       lastMessageSenderId: '',
       lastMessageTimestamp: now,
+      readBy: { [currentUser.id]: now },
       createdAt: now,
       updatedAt: now,
     };
@@ -771,7 +1318,169 @@ export async function getOrCreateConversation(
     await setDoc(doc(db, 'conversations', convId), newConv);
     return convId;
   } catch (error) {
+    if (error instanceof Error && error.message.includes('المتابعين فقط')) {
+      throw error;
+    }
     handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function createGroupConversation(
+  creator: UserProfile,
+  members: UserProfile[],
+  payload: {
+    groupName: string;
+    groupDescription?: string;
+    groupAvatar?: string;
+  }
+): Promise<string> {
+  const convId = `gconv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const path = `conversations/${convId}`;
+  try {
+    const now = new Date().toISOString();
+    const uniqueUsers = [creator, ...members.filter((m) => m.id !== creator.id)];
+    const participantIds = uniqueUsers.map((u) => u.id);
+    const participantDetails: Conversation['participantDetails'] = {};
+    uniqueUsers.forEach((u) => {
+      participantDetails[u.id] = stripUndefined({
+        displayName: u.displayName,
+        handle: u.handle,
+        photoURL: u.photoURL || '',
+        isVerified: Boolean(u.isVerified),
+        verificationCategory: u.verificationCategory,
+      });
+    });
+
+    const newConv: Conversation = stripUndefined({
+      id: convId,
+      participantIds,
+      participantDetails,
+      isGroup: true,
+      groupName: payload.groupName.trim(),
+      groupDescription: payload.groupDescription?.trim() || '',
+      groupAvatar: payload.groupAvatar || '',
+      createdBy: creator.id,
+      lastMessageText: `تم إنشاء "${payload.groupName.trim()}"`,
+      lastMessageSenderId: creator.id,
+      lastMessageTimestamp: now,
+      readBy: { [creator.id]: now },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await setDoc(doc(db, 'conversations', convId), newConv);
+
+    await Promise.allSettled(
+      uniqueUsers
+        .filter((u) => u.id !== creator.id)
+        .map((u) =>
+          createNotification({
+            recipientId: u.id,
+            senderId: creator.id,
+            senderName: creator.displayName,
+            senderPhotoURL: creator.photoURL,
+            type: 'message',
+            targetId: convId,
+            message: `أضافك إلى دردشة جماعية: ${payload.groupName.trim()}`.slice(0, 80),
+          })
+        )
+    );
+
+    return convId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function addGroupConversationMembers(
+  conversation: Conversation,
+  newMembers: UserProfile[],
+  actor: UserProfile
+): Promise<void> {
+  const path = `conversations/${conversation.id}`;
+  try {
+    const now = new Date().toISOString();
+    const existingIds = new Set(conversation.participantIds || []);
+    const added = newMembers.filter((m) => !existingIds.has(m.id));
+    if (added.length === 0) return;
+
+    const nextIds = [...conversation.participantIds, ...added.map((m) => m.id)];
+    const nextDetails = { ...(conversation.participantDetails || {}) };
+    added.forEach((u) => {
+      nextDetails[u.id] = stripUndefined({
+        displayName: u.displayName,
+        handle: u.handle,
+        photoURL: u.photoURL || '',
+        isVerified: Boolean(u.isVerified),
+        verificationCategory: u.verificationCategory,
+      });
+    });
+
+    await updateDoc(doc(db, 'conversations', conversation.id), {
+      participantIds: nextIds,
+      participantDetails: nextDetails,
+      updatedAt: now,
+    });
+
+    await Promise.allSettled(
+      added.map((u) =>
+        createNotification({
+          recipientId: u.id,
+          senderId: actor.id,
+          senderName: actor.displayName,
+          senderPhotoURL: actor.photoURL,
+          type: 'message',
+          targetId: conversation.id,
+          message: `أضافك إلى "${conversation.groupName || 'دردشة جماعية'}"`.slice(0, 80),
+        })
+      )
+    );
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function leaveGroupConversation(
+  conversation: Conversation,
+  userId: string
+): Promise<void> {
+  const path = `conversations/${conversation.id}`;
+  try {
+    const nextIds = (conversation.participantIds || []).filter((id) => id !== userId);
+    const nextDetails = { ...(conversation.participantDetails || {}) };
+    delete nextDetails[userId];
+    await updateDoc(doc(db, 'conversations', conversation.id), {
+      participantIds: nextIds,
+      participantDetails: nextDetails,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function markConversationRead(conversationId: string, userId: string): Promise<void> {
+  const path = `conversations/${conversationId}`;
+  try {
+    await updateDoc(doc(db, 'conversations', conversationId), {
+      [`readBy.${userId}`]: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.warn('Could not mark conversation read:', path, error);
+  }
+}
+
+export async function setConversationTyping(
+  conversationId: string,
+  userId: string,
+  isTyping: boolean
+): Promise<void> {
+  try {
+    await updateDoc(doc(db, 'conversations', conversationId), {
+      [`typingUsers.${userId}`]: isTyping ? new Date().toISOString() : '',
+    });
+  } catch {
+    // Non-blocking typing indicator
   }
 }
 
@@ -780,43 +1489,167 @@ export async function sendMessage(
   sender: UserProfile,
   recipientId: string,
   text: string,
-  mediaURL?: string
+  mediaURL?: string,
+  extra?: {
+    messageType?: Message['messageType'];
+    mediaType?: 'image' | 'video';
+    mediaPath?: string;
+    mediaMetadata?: MediaMetadata;
+    audioURL?: string;
+    audioDurationSec?: number;
+    stickerId?: string;
+    stickerUrl?: string;
+    replyTo?: Message['replyTo'];
+    recipientIds?: string[];
+  }
 ): Promise<string> {
   const msgId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   const path = `conversations/${conversationId}/messages/${msgId}`;
   try {
     const now = new Date().toISOString();
-    const msg: Message = {
+    const messageType: Message['messageType'] =
+      extra?.messageType ||
+      (extra?.audioURL
+        ? 'audio'
+        : extra?.stickerId
+        ? 'sticker'
+        : mediaURL
+        ? extra?.mediaType === 'video'
+          ? 'video'
+          : 'image'
+        : 'text');
+
+    const msg: Message = stripUndefined({
       id: msgId,
       conversationId,
       senderId: sender.id,
       senderName: sender.displayName,
-      text,
+      senderPhotoURL: sender.photoURL || '',
+      messageType,
+      text: text || '',
       mediaURL: mediaURL || '',
+      mediaType: extra?.mediaType,
+      mediaPath: extra?.mediaPath,
+      mediaMetadata: extra?.mediaMetadata,
+      audioURL: extra?.audioURL,
+      audioDurationSec: extra?.audioDurationSec,
+      stickerId: extra?.stickerId,
+      stickerUrl: extra?.stickerUrl,
+      replyTo: extra?.replyTo,
+      reactions: {},
       createdAt: now,
-    };
+    });
+
+    const summaryText =
+      text.trim() ||
+      (messageType === 'audio'
+        ? '🎙️ رسالة صوتية'
+        : messageType === 'video'
+        ? '🎬 فيديو'
+        : messageType === 'image'
+        ? '🖼️ صورة'
+        : messageType === 'sticker'
+        ? '✨ ملصق'
+        : '');
 
     await setDoc(doc(db, 'conversations', conversationId, 'messages', msgId), msg);
     await updateDoc(doc(db, 'conversations', conversationId), {
-      lastMessageText: text,
+      lastMessageText: summaryText,
       lastMessageSenderId: sender.id,
       lastMessageTimestamp: now,
       updatedAt: now,
+      [`readBy.${sender.id}`]: now,
+      [`typingUsers.${sender.id}`]: '',
     });
 
-    await createNotification({
-      recipientId,
-      senderId: sender.id,
-      senderName: sender.displayName,
-      senderPhotoURL: sender.photoURL,
-      type: 'message',
-      targetId: conversationId,
-      message: `sent you a message: "${text.slice(0, 30)}${text.length > 30 ? '...' : ''}"`,
-    });
+    const targets = Array.from(
+      new Set(
+        (extra?.recipientIds && extra.recipientIds.length > 0
+          ? extra.recipientIds
+          : recipientId
+          ? [recipientId]
+          : []
+        ).filter((id) => id && id !== sender.id)
+      )
+    );
+
+    await Promise.allSettled(
+      targets.map((rid) =>
+        createNotification({
+          recipientId: rid,
+          senderId: sender.id,
+          senderName: sender.displayName,
+          senderPhotoURL: sender.photoURL,
+          type: 'message',
+          targetId: conversationId,
+          message: summaryText.slice(0, 50),
+        })
+      )
+    );
 
     return msgId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function toggleDirectMessageReaction(
+  conversationId: string,
+  message: Message,
+  emoji: string,
+  userId: string
+): Promise<void> {
+  const path = `conversations/${conversationId}/messages/${message.id}`;
+  try {
+    const existing = { ...(message.reactions || {}) };
+    const users = new Set(existing[emoji] || []);
+    if (users.has(userId)) {
+      users.delete(userId);
+    } else {
+      users.add(userId);
+    }
+    if (users.size === 0) {
+      delete existing[emoji];
+    } else {
+      existing[emoji] = Array.from(users);
+    }
+    await updateDoc(doc(db, 'conversations', conversationId, 'messages', message.id), {
+      reactions: existing,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function editDirectMessage(
+  conversationId: string,
+  messageId: string,
+  newText: string
+): Promise<void> {
+  const path = `conversations/${conversationId}/messages/${messageId}`;
+  try {
+    await updateDoc(doc(db, 'conversations', conversationId, 'messages', messageId), {
+      text: newText.trim().slice(0, 2000),
+      editedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function deleteDirectMessage(conversationId: string, messageId: string): Promise<void> {
+  const path = `conversations/${conversationId}/messages/${messageId}`;
+  try {
+    await updateDoc(doc(db, 'conversations', conversationId, 'messages', messageId), {
+      text: '',
+      mediaURL: '',
+      audioURL: '',
+      stickerId: '',
+      stickerUrl: '',
+      deletedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
   }
 }
 
@@ -831,6 +1664,21 @@ export async function createNotification(
   const notifId = `notif_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const path = `notifications/${notifId}`;
   try {
+    // Respect recipient's stored notification preferences when available
+    const recipientSnap = await getDoc(doc(db, 'users', notif.recipientId)).catch(() => null);
+    const prefs = recipientSnap?.exists()
+      ? (recipientSnap.data() as UserProfile).customization?.notifications
+      : undefined;
+    if (prefs) {
+      if (notif.type === 'like' && prefs.likes === false) return;
+      if (notif.type === 'comment' && prefs.comments === false) return;
+      if (notif.type === 'follow' && prefs.follows === false) return;
+      if (notif.type === 'message' && prefs.messages === false) return;
+      if (notif.type === 'event' && prefs.announcements === false) {
+        return;
+      }
+    }
+
     const item: NotificationItem = {
       ...notif,
       id: notifId,
@@ -839,7 +1687,7 @@ export async function createNotification(
     };
     await setDoc(doc(db, 'notifications', notifId), item);
   } catch (error) {
-    console.error('Failed to create notification:', error);
+    console.error('Failed to create notification:', path, error);
   }
 }
 
@@ -924,11 +1772,27 @@ export async function deletePostAsAdmin(postId: string): Promise<void> {
   }
 }
 
-export async function updateUserRoleAsAdmin(targetUserId: string, newRole: 'user' | 'moderator' | 'admin' | 'owner'): Promise<void> {
+export async function updateUserRoleAsAdmin(
+  targetUserId: string,
+  newRole: UserRole,
+  actor?: { id: string; name: string; role: UserRole }
+): Promise<void> {
   const path = `users/${targetUserId}`;
   try {
     await updateDoc(doc(db, 'users', targetUserId), { role: newRole });
     await updateDoc(doc(db, 'users', targetUserId, 'private', 'info'), { role: newRole }).catch(() => {});
+
+    if (actor) {
+      await recordAuditLog({
+        actorId: actor.id,
+        actorName: actor.name,
+        actorRole: actor.role,
+        actionType: 'role_change',
+        targetType: 'user',
+        targetId: targetUserId,
+        targetDetails: `Updated user role to ${newRole}`,
+      });
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
@@ -937,7 +1801,10 @@ export async function updateUserRoleAsAdmin(targetUserId: string, newRole: 'user
 export async function updateUserVerification(targetUserId: string, isVerified: boolean): Promise<void> {
   const path = `users/${targetUserId}`;
   try {
-    await updateDoc(doc(db, 'users', targetUserId), { isVerified });
+    await updateDoc(doc(db, 'users', targetUserId), {
+      isVerified,
+      verificationStatus: isVerified ? 'verified' : 'not_verified',
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
@@ -950,20 +1817,22 @@ export async function updateUserVerification(targetUserId: string, isVerified: b
 export async function submitReport(report: {
   reporterId: string;
   reporterName: string;
-  targetType: 'post' | 'user' | 'comment';
+  targetType: ModerationReport['targetType'];
   targetId: string;
+  roomId?: string;
+  conversationId?: string;
   targetContentSnippet?: string;
   reason: string;
 }): Promise<string> {
   const reportId = `rep_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   const path = `reports/${reportId}`;
   try {
-    const item = {
+    const item = stripUndefined({
       ...report,
       id: reportId,
       status: 'pending',
       createdAt: new Date().toISOString(),
-    };
+    });
     await setDoc(doc(db, 'reports', reportId), item);
     return reportId;
   } catch (error) {
@@ -1005,17 +1874,55 @@ export async function updateReportResolution(
 }
 
 /* =========================================================================
-   EVENTS
+   REAL EVENTS SYSTEM
    ========================================================================= */
 
-export function listenToEvents(callback: (events: any[]) => void): Unsubscribe {
+const LEGACY_SEEDED_EVENT_IDS = new Set([
+  'event_design_2026',
+  'event_dev_night',
+  'event_gaming_2026',
+]);
+
+export function computeEventLifecycleStatus(event: CommunityEvent): 'upcoming' | 'ongoing' | 'ended' | 'cancelled' {
+  if (event.status === 'cancelled') return 'cancelled';
+  try {
+    if (!event.dateStr) return event.status || 'upcoming';
+    const startIso = `${event.dateStr}T${event.timeStr || '00:00'}`;
+    const startMs = new Date(startIso).getTime();
+    if (Number.isNaN(startMs)) return event.status || 'upcoming';
+
+    const endMs = event.endDateStr
+      ? new Date(`${event.endDateStr}T${event.endTimeStr || '23:59'}`).getTime()
+      : startMs + 3 * 60 * 60 * 1000;
+
+    const nowMs = Date.now();
+    if (nowMs < startMs) return 'upcoming';
+    if (nowMs <= endMs) return 'ongoing';
+    return 'ended';
+  } catch {
+    return event.status || 'upcoming';
+  }
+}
+
+export function listenToEvents(callback: (events: CommunityEvent[]) => void): Unsubscribe {
   const path = 'events';
   const q = collection(db, 'events');
   return onSnapshot(
     q,
     (snapshot) => {
-      const items: any[] = [];
-      snapshot.forEach((d) => items.push(d.data()));
+      const items: CommunityEvent[] = [];
+      snapshot.forEach((d) => {
+        const data = { id: d.id, ...d.data() } as CommunityEvent;
+        // Never surface legacy unowned seeded demo records
+        if (LEGACY_SEEDED_EVENT_IDS.has(d.id) && !data.creatorId) {
+          return;
+        }
+        items.push({
+          ...data,
+          status: computeEventLifecycleStatus(data),
+        });
+      });
+      items.sort((a, b) => (b.createdAt || b.dateStr || '').localeCompare(a.createdAt || a.dateStr || ''));
       callback(items);
     },
     (error) => {
@@ -1028,7 +1935,7 @@ export function listenToEvents(callback: (events: any[]) => void): Unsubscribe {
 export async function registerForCommunityEvent(
   eventId: string,
   userId: string
-): Promise<void> {
+): Promise<'registered' | 'pending'> {
   const path = `events/${eventId}`;
   try {
     const eventRef = doc(db, 'events', eventId);
@@ -1036,9 +1943,62 @@ export async function registerForCommunityEvent(
     if (!snap.exists()) {
       throw new Error(`الفعالية المطلوبة غير موجودة في قاعدة البيانات (ID: ${eventId})`);
     }
+    const evt = snap.data() as CommunityEvent;
+    if (evt.status === 'cancelled') {
+      throw new Error('تم إلغاء هذه الفعالية ولا يمكن التسجيل بها.');
+    }
+    if (evt.requireApproval) {
+      await updateDoc(eventRef, {
+        pendingUserIds: arrayUnion(userId),
+      });
+      return 'pending';
+    }
     await updateDoc(eventRef, {
       registeredUserIds: arrayUnion(userId),
       participantsCount: increment(1),
+    });
+    void awardUserXp('event_join');
+    return 'registered';
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+    throw error;
+  }
+}
+
+export async function reviewEventParticipation(
+  eventId: string,
+  targetUserId: string,
+  approve: boolean,
+  actor: { id: string; name: string }
+): Promise<void> {
+  const path = `events/${eventId}`;
+  try {
+    const eventRef = doc(db, 'events', eventId);
+    const snap = await getDoc(eventRef);
+    if (!snap.exists()) throw new Error('الفعالية غير موجودة.');
+    const evt = snap.data() as CommunityEvent;
+
+    if (approve) {
+      await updateDoc(eventRef, {
+        pendingUserIds: arrayRemove(targetUserId),
+        registeredUserIds: arrayUnion(targetUserId),
+        participantsCount: increment(1),
+      });
+    } else {
+      await updateDoc(eventRef, {
+        pendingUserIds: arrayRemove(targetUserId),
+      });
+    }
+
+    await createNotification({
+      recipientId: targetUserId,
+      senderId: actor.id,
+      senderName: actor.name,
+      type: 'event',
+      targetId: eventId,
+      message: approve
+        ? `تمت الموافقة على مشاركتك في فعالية "${evt.title}".`
+        : `لم يتم قبول طلب مشاركتك في فعالية "${evt.title}".`,
     });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
@@ -1050,13 +2010,120 @@ export async function leaveCommunityEvent(eventId: string, userId: string): Prom
   const path = `events/${eventId}`;
   try {
     const eventRef = doc(db, 'events', eventId);
+    const snap = await getDoc(eventRef);
+    if (!snap.exists()) return;
+    const evt = snap.data() as CommunityEvent;
+    const wasRegistered = (evt.registeredUserIds || []).includes(userId);
     await updateDoc(eventRef, {
+      pendingUserIds: arrayRemove(userId),
       registeredUserIds: arrayRemove(userId),
-      participantsCount: increment(-1),
+      ...(wasRegistered ? { participantsCount: increment(-1) } : {}),
     });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
     throw error;
+  }
+}
+
+export async function createCommunityEvent(payload: {
+  title: string;
+  subtitle: string;
+  category: 'official' | 'challenge' | 'competitions' | 'general';
+  badgeText: string;
+  dateStr: string;
+  timeStr: string;
+  endDateStr?: string;
+  endTimeStr?: string;
+  locationType?: 'online' | 'in_person';
+  locationDetails?: string;
+  organizerId?: string;
+  organizerName?: string;
+  requireApproval?: boolean;
+  imageURL?: string;
+  coverPath?: string;
+  creatorId: string;
+  creatorRole?: UserRole;
+}): Promise<string> {
+  const eventId = `evt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const path = `events/${eventId}`;
+  try {
+    const now = new Date().toISOString();
+    const docData: CommunityEvent = stripUndefined({
+      id: eventId,
+      title: payload.title.trim(),
+      subtitle: payload.subtitle.trim(),
+      category: payload.category,
+      badgeText: payload.badgeText.trim() || 'فعالية',
+      dateStr: payload.dateStr.trim(),
+      timeStr: payload.timeStr.trim(),
+      endDateStr: payload.endDateStr?.trim() || undefined,
+      endTimeStr: payload.endTimeStr?.trim() || undefined,
+      locationType: payload.locationType || 'online',
+      locationDetails: payload.locationDetails?.trim() || '',
+      organizerId: payload.organizerId || payload.creatorId,
+      organizerName: payload.organizerName?.trim() || '',
+      status: 'upcoming',
+      requireApproval: Boolean(payload.requireApproval),
+      pendingUserIds: [],
+      imageURL: payload.imageURL || '',
+      coverPath: payload.coverPath || undefined,
+      participantsCount: 0,
+      registeredUserIds: [],
+      creatorId: payload.creatorId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await setDoc(doc(db, 'events', eventId), docData);
+
+    await recordAuditLog({
+      actorId: payload.creatorId,
+      actorName: payload.organizerName || 'Organizer',
+      actorRole: payload.creatorRole || 'admin',
+      actionType: 'event_create',
+      targetType: 'event',
+      targetId: eventId,
+      targetDetails: `Created event "${docData.title}"`,
+    });
+
+    return eventId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function updateCommunityEvent(
+  eventId: string,
+  updates: Partial<CommunityEvent>,
+  actor: { id: string; name: string; role: UserRole }
+): Promise<void> {
+  const path = `events/${eventId}`;
+  try {
+    await updateDoc(doc(db, 'events', eventId), stripUndefined({
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    }));
+    await recordAuditLog({
+      actorId: actor.id,
+      actorName: actor.name,
+      actorRole: actor.role,
+      actionType: updates.status === 'cancelled' ? 'event_cancel' : 'event_update',
+      targetType: 'event',
+      targetId: eventId,
+      targetDetails: updates.status === 'cancelled'
+        ? `Cancelled event ${eventId}`
+        : `Updated event ${eventId}`,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function deleteCommunityEvent(eventId: string): Promise<void> {
+  const path = `events/${eventId}`;
+  try {
+    await deleteDoc(doc(db, 'events', eventId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
 
@@ -1133,6 +2200,34 @@ export function listenToUserVerificationRequest(
   );
 }
 
+export async function getAdminVerificationNote(userId: string): Promise<AdminVerificationNote | null> {
+  const path = `users/${userId}/admin_notes/verification`;
+  try {
+    const snap = await getDoc(doc(db, 'users', userId, 'admin_notes', 'verification'));
+    if (!snap.exists()) return null;
+    return snap.data() as AdminVerificationNote;
+  } catch (error) {
+    console.warn('Could not read admin verification note:', path, error);
+    return null;
+  }
+}
+
+async function saveAdminVerificationNote(
+  targetUserId: string,
+  note: string,
+  status: VerificationStatus,
+  actor: { id: string; name: string }
+): Promise<void> {
+  await setDoc(doc(db, 'users', targetUserId, 'admin_notes', 'verification'), {
+    userId: targetUserId,
+    note,
+    status,
+    updatedBy: actor.id,
+    updatedByName: actor.name,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
 export async function reviewVerificationRequest(
   requestId: string,
   targetUserId: string,
@@ -1147,6 +2242,7 @@ export async function reviewVerificationRequest(
     await updateDoc(doc(db, 'verification_requests', requestId), {
       status,
       reviewerId: reviewer.id,
+      reviewerName: reviewer.name,
       reviewerNotes: reviewerNotes || '',
       reviewedAt: now,
     });
@@ -1155,9 +2251,19 @@ export async function reviewVerificationRequest(
       await updateDoc(doc(db, 'users', targetUserId), {
         isVerified: true,
         verificationCategory: category,
+        verificationStatus: 'verified',
+        verifiedAt: now,
+        verifiedBy: reviewer.id,
+        verifiedByName: reviewer.name,
       });
 
-      // Audit log
+      await saveAdminVerificationNote(
+        targetUserId,
+        reviewerNotes || 'Approved via verification request',
+        'verified',
+        reviewer
+      ).catch(() => {});
+
       await recordAuditLog({
         actorId: reviewer.id,
         actorName: reviewer.name,
@@ -1165,10 +2271,10 @@ export async function reviewVerificationRequest(
         actionType: 'verify_approve',
         targetType: 'verification',
         targetId: targetUserId,
-        targetDetails: `Approved ${category} verification badge. Notes: ${reviewerNotes || 'None'}`,
+        reason: reviewerNotes || undefined,
+        targetDetails: `Approved ${category} verification badge.`,
       });
 
-      // Notification
       await createNotification({
         recipientId: targetUserId,
         senderId: reviewer.id,
@@ -1177,7 +2283,17 @@ export async function reviewVerificationRequest(
         message: `تهانينا! تمت الموافقة على طلب توثيق حسابك (${category === 'silver' ? 'الفضي' : category === 'institution' ? 'المؤسسي' : category === 'blood_red' ? 'الملكي الخاص' : 'الأزرق'}).`,
       });
     } else {
-      // Audit log
+      await updateDoc(doc(db, 'users', targetUserId), {
+        verificationStatus: status === 'rejected' ? 'rejected' : 'pending',
+      }).catch(() => {});
+
+      await saveAdminVerificationNote(
+        targetUserId,
+        reviewerNotes || 'Rejected verification request',
+        status === 'rejected' ? 'rejected' : 'pending',
+        reviewer
+      ).catch(() => {});
+
       await recordAuditLog({
         actorId: reviewer.id,
         actorName: reviewer.name,
@@ -1185,16 +2301,16 @@ export async function reviewVerificationRequest(
         actionType: 'verify_reject',
         targetType: 'verification',
         targetId: targetUserId,
-        targetDetails: `Rejected ${category} verification request. Reason: ${reviewerNotes || 'None'}`,
+        reason: reviewerNotes || undefined,
+        targetDetails: `Rejected ${category} verification request.`,
       });
 
-      // Notification
       await createNotification({
         recipientId: targetUserId,
         senderId: reviewer.id,
         senderName: 'Q Verification Desk',
         type: 'verification',
-        message: `تم تحديث حالة طلب التوثيق: ${status === 'rejected' ? 'مرفوض' : 'مطلوب معلومات إضافية'}. ملاحظة: ${reviewerNotes || ''}`,
+        message: `تم تحديث حالة طلب التوثيق: ${status === 'rejected' ? 'مرفوض' : 'مطلوب معلومات إضافية'}.${reviewerNotes ? ` ملاحظة: ${reviewerNotes}` : ''}`,
       });
     }
   } catch (error) {
@@ -1209,7 +2325,6 @@ export async function updateUserVerificationDirect(
   actor: { id: string; name: string; role: UserRole },
   reason?: string
 ): Promise<void> {
-  // Blood-Red verification strictly restricted to platform owner
   if (category === 'blood_red' && actor.role !== 'owner') {
     throw new Error('فقط مالك المنصة مخول بمنح أو سحب التوثيق الملكي الخاص.');
   }
@@ -1223,8 +2338,17 @@ export async function updateUserVerificationDirect(
       verificationStatus: isVerified ? 'verified' : 'not_verified',
       verifiedAt: isVerified ? now : null,
       verifiedBy: isVerified ? actor.id : null,
-      verificationNote: reason || '',
+      verifiedByName: isVerified ? actor.name : null,
     });
+
+    if (reason && reason.trim()) {
+      await saveAdminVerificationNote(
+        targetUserId,
+        reason.trim(),
+        isVerified ? 'verified' : 'not_verified',
+        actor
+      ).catch(() => {});
+    }
 
     await recordAuditLog({
       actorId: actor.id,
@@ -1234,7 +2358,7 @@ export async function updateUserVerificationDirect(
       targetType: 'user',
       targetId: targetUserId,
       reason: reason || undefined,
-      targetDetails: `${isVerified ? 'Granted' : 'Revoked'} ${category} verification badge. ${reason ? `Note: ${reason}` : ''}`,
+      targetDetails: `${isVerified ? 'Granted' : 'Revoked'} ${category} verification badge.`,
     });
 
     await createNotification({
@@ -1642,5 +2766,368 @@ export async function getPlatformOverviewStats(): Promise<{
     };
   }
 }
+
+/* =========================================================================
+   XP ENGINE, LEVELING, CUSTOM TITLES & PROFILE GOVERNANCE
+   ========================================================================= */
+
+export async function awardUserXp(
+  action: XpLogEntry['action']
+): Promise<{ awarded: boolean; xpDelta?: number; xp?: number; level?: number } | null> {
+  try {
+    const fbUser = auth.currentUser;
+    if (!fbUser) return null;
+    const token = await fbUser.getIdToken();
+    const res = await fetch('/api/xp/award', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ action }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export function listenToUserXpLogs(
+  userId: string,
+  callback: (logs: XpLogEntry[]) => void
+): Unsubscribe {
+  const q = query(
+    collection(db, 'xpLogs'),
+    where('userId', '==', userId),
+    limit(40)
+  );
+  return onSnapshot(
+    q,
+    (snap) => {
+      const items: XpLogEntry[] = [];
+      snap.forEach((d) => items.push({ id: d.id, ...d.data() } as XpLogEntry));
+      items.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      callback(items);
+    },
+    () => callback([])
+  );
+}
+
+export function listenToCustomTitlePresets(
+  callback: (presets: CustomTitlePreset[]) => void
+): Unsubscribe {
+  const q = query(collection(db, 'customTitles'), limit(80));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const items: CustomTitlePreset[] = [];
+      snap.forEach((d) => items.push({ id: d.id, ...d.data() } as CustomTitlePreset));
+      items.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      callback(items);
+    },
+    () => callback([])
+  );
+}
+
+export async function createCustomTitlePreset(payload: {
+  text: string;
+  color: string;
+  bgColor?: string;
+  borderColor?: string;
+  gradient?: string;
+  icon?: string;
+  shape?: 'tag' | 'shield' | 'banner';
+  priority?: number;
+  createdBy: string;
+  createdByName: string;
+}): Promise<CustomTitlePreset> {
+  const id = `title_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const item: CustomTitlePreset = stripUndefined({
+    id,
+    text: payload.text.trim().slice(0, 32),
+    color: payload.color || '#3B6DFF',
+    bgColor: payload.bgColor || undefined,
+    borderColor: payload.borderColor || undefined,
+    gradient: payload.gradient || undefined,
+    icon: payload.icon || 'Award',
+    shape: payload.shape || 'tag',
+    priority: Number.isFinite(payload.priority) ? payload.priority : 1,
+    createdBy: payload.createdBy,
+    createdByName: payload.createdByName,
+    createdAt: new Date().toISOString(),
+  });
+  await setDoc(doc(db, 'customTitles', id), item);
+  return item;
+}
+
+export async function deleteCustomTitlePreset(presetId: string): Promise<void> {
+  await deleteDoc(doc(db, 'customTitles', presetId));
+}
+
+export interface ProfileGovernanceActionPayload {
+  targetUserId: string;
+  action:
+    | 'grant_title'
+    | 'revoke_title'
+    | 'restrict'
+    | 'unrestrict'
+    | 'suspend'
+    | 'ban'
+    | 'unban'
+    | 'change_role'
+    | 'appoint_room_leader'
+    | 'appoint_moderator'
+    | 'remove_staff'
+    | 'kick_from_room'
+    | 'warn';
+  reason?: string;
+  newRole?: UserRole;
+  durationHours?: number;
+  customTitle?: CustomTitle | null;
+  titleId?: string;
+  roomId?: string;
+}
+
+export async function performProfileGovernanceAction(
+  payload: ProfileGovernanceActionPayload
+): Promise<{ ok: boolean; message?: string }> {
+  const fbUser = auth.currentUser;
+  if (!fbUser) {
+    throw new Error('يجب تسجيل الدخول لتنفيذ هذا الإجراء الإداري.');
+  }
+  const token = await fbUser.getIdToken();
+  const res = await fetch('/api/moderation/profile-action', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error || 'تعذر تنفيذ الإجراء الإداري.');
+  }
+  return data;
+}
+
+/* =========================================================================
+   GLOBAL CUSTOM ADMIN ROLES & GRANULAR PERMISSIONS + OFFICIAL BROADCASTS
+   ========================================================================= */
+
+export function listenToGlobalAdminRoles(
+  callback: (roles: GlobalAdminRole[]) => void
+): Unsubscribe {
+  const q = query(collection(db, 'globalAdminRoles'), limit(50));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const items: GlobalAdminRole[] = [];
+      snap.forEach((d) => items.push({ id: d.id, ...d.data() } as GlobalAdminRole));
+      items.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      callback(items);
+    },
+    () => callback([])
+  );
+}
+
+export async function performGlobalRoleAction(payload: {
+  operation: 'create_role' | 'update_role' | 'delete_role' | 'assign_user_role';
+  roleId?: string;
+  name?: string;
+  description?: string;
+  color?: string;
+  permissions?: Partial<Record<GlobalPermissionKey, boolean>>;
+  targetUserId?: string;
+  baseRole?: UserRole;
+}): Promise<{ ok: boolean; role?: GlobalAdminRole }> {
+  const fbUser = auth.currentUser;
+  if (!fbUser) throw new Error('يجب تسجيل الدخول.');
+  const token = await fbUser.getIdToken();
+  const res = await fetch('/api/admin/roles', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error || 'تعذر تحديث الرتب والصلاحيات.');
+  return data;
+}
+
+export function listenToPlatformAnnouncements(
+  callback: (items: PlatformAnnouncement[]) => void
+): Unsubscribe {
+  const q = query(collection(db, 'platformAnnouncements'), limit(40));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const items: PlatformAnnouncement[] = [];
+      snap.forEach((d) => items.push({ id: d.id, ...d.data() } as PlatformAnnouncement));
+      items.sort((a, b) => (b.publishAt || b.createdAt).localeCompare(a.publishAt || a.createdAt));
+      callback(items);
+    },
+    () => callback([])
+  );
+}
+
+export function listenToPlatformAds(
+  callback: (items: PlatformAd[]) => void
+): Unsubscribe {
+  const q = query(collection(db, 'platformAds'), limit(40));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const items: PlatformAd[] = [];
+      snap.forEach((d) => items.push({ id: d.id, ...d.data() } as PlatformAd));
+      items.sort((a, b) => (b.publishAt || b.createdAt).localeCompare(a.publishAt || a.createdAt));
+      callback(items);
+    },
+    () => callback([])
+  );
+}
+
+export async function performBroadcastAction(payload: {
+  kind: 'announcement' | 'ad';
+  operation: 'create' | 'update' | 'toggle_pause' | 'delete';
+  id?: string;
+  title?: string;
+  content?: string;
+  bannerURL?: string;
+  mediaURL?: string;
+  ctaLabel?: string;
+  targetUrl?: string;
+  sponsorName?: string;
+  isPaused?: boolean;
+  playSound?: boolean;
+  publishAt?: string;
+  expiresAt?: string;
+  notifyUserIds?: string[];
+}): Promise<{ ok: boolean; id?: string }> {
+  const fbUser = auth.currentUser;
+  if (!fbUser) throw new Error('يجب تسجيل الدخول.');
+  const token = await fbUser.getIdToken();
+  const res = await fetch('/api/admin/broadcasts', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error || 'تعذر تنفيذ إجراء الإعلان.');
+  return data;
+}
+
+/* =========================================================================
+   SAFE IDEMPOTENT CLEANUP OF LEGACY SEEDED DEMO RECORDS ONLY
+   ========================================================================= */
+
+export async function cleanupLegacySeededDemoData(): Promise<void> {
+  try {
+    // 1. Delete only confirmed legacy Unsplash demo events without creatorId
+    for (const evtId of LEGACY_SEEDED_EVENT_IDS) {
+      const ref = doc(db, 'events', evtId);
+      const snap = await getDoc(ref).catch(() => null);
+      if (snap?.exists()) {
+        const data = snap.data() as CommunityEvent;
+        if (!data.creatorId && (!data.imageURL || data.imageURL.includes('unsplash.com'))) {
+          await deleteDoc(ref).catch(() => {});
+        }
+      }
+    }
+
+    // 2. Migrate & remove legacy groups only if confirmed unpopulated/test group
+    const groupsSnap = await getDocs(query(collection(db, 'groups'), limit(25))).catch(() => null);
+    if (groupsSnap && !groupsSnap.empty) {
+      for (const gDoc of groupsSnap.docs) {
+        const gData = gDoc.data() as {
+          id: string;
+          name?: string;
+          ownerId?: string;
+          ownerName?: string;
+          description?: string;
+          avatarURL?: string;
+          createdAt?: string;
+        };
+        const roomsSnap = await getDocs(collection(db, 'groups', gDoc.id, 'chatRooms')).catch(() => null);
+        if (roomsSnap && !roomsSnap.empty) {
+          for (const rDoc of roomsSnap.docs) {
+            const rData = rDoc.data() as {
+              id?: string;
+              title?: string;
+              description?: string;
+              ownerId?: string;
+              ownerName?: string;
+              moderatorIds?: string[];
+              invitedUserIds?: string[];
+              type?: string;
+              memberCount?: number;
+              lastMessageText?: string;
+              lastMessageAt?: string;
+              createdAt?: string;
+            };
+            const msgsSnap = await getDocs(
+              collection(db, 'groups', gDoc.id, 'chatRooms', rDoc.id, 'messages')
+            ).catch(() => null);
+
+            if (msgsSnap && !msgsSnap.empty) {
+              const targetRoomId = `room_${rDoc.id}`;
+              const roomDoc: ChatRoom = {
+                id: targetRoomId,
+                title: rData.title || gData.name || 'غرفة دردشة',
+                description: rData.description || gData.description || '',
+                imageURL: gData.avatarURL || '',
+                visibility: rData.type === 'private' ? 'private' : rData.type === 'staff' ? 'staff' : 'public',
+                ownerId: rData.ownerId || gData.ownerId || '',
+                ownerName: rData.ownerName || gData.ownerName || 'Q Member',
+                leaderIds: rData.ownerId ? [rData.ownerId] : [],
+                moderatorIds: rData.moderatorIds || [],
+                allowedUserIds: rData.invitedUserIds || [],
+                bannedUserIds: [],
+                memberCount: rData.memberCount || 1,
+                lastMessageText: rData.lastMessageText || '',
+                lastMessageAt: rData.lastMessageAt || rData.createdAt || new Date().toISOString(),
+                createdAt: rData.createdAt || gData.createdAt || new Date().toISOString(),
+              };
+              await setDoc(doc(db, 'chatRooms', targetRoomId), roomDoc, { merge: true }).catch(() => {});
+              for (const mDoc of msgsSnap.docs) {
+                const mData = mDoc.data() as Record<string, any>;
+                const migratedMsg: ChatRoomMessage = {
+                  id: mDoc.id,
+                  roomId: targetRoomId,
+                  senderId: mData.senderId || '',
+                  senderName: mData.senderName || 'Q Member',
+                  senderHandle: mData.senderHandle || 'member',
+                  senderPhotoURL: mData.senderPhotoURL || '',
+                  text: mData.text || '',
+                  mediaURL: mData.mediaURL || '',
+                  createdAt: mData.createdAt || new Date().toISOString(),
+                };
+                await setDoc(doc(db, 'chatRooms', targetRoomId, 'messages', mDoc.id), migratedMsg).catch(() => {});
+                await deleteDoc(mDoc.ref).catch(() => {});
+              }
+            }
+            await deleteDoc(rDoc.ref).catch(() => {});
+          }
+        }
+        const membersSnap = await getDocs(collection(db, 'groups', gDoc.id, 'members')).catch(() => null);
+        if (membersSnap && !membersSnap.empty) {
+          for (const mDoc of membersSnap.docs) {
+            await deleteDoc(mDoc.ref).catch(() => {});
+          }
+        }
+        await deleteDoc(gDoc.ref).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.warn('Non-blocking legacy demo cleanup warning:', err);
+  }
+}
+
 
 

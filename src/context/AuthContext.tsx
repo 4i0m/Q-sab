@@ -12,13 +12,16 @@ import {
 import { auth, testConnection } from '../firebase/config';
 import {
   UserProfile,
-  PresenceRecord
+  PresenceRecord,
+  UserRole,
+  getRoleRank
 } from '../types';
 import {
   syncUserProfile,
   getUserProfile,
   sendPresenceHeartbeat,
-  listenToActivePresence
+  listenToActivePresence,
+  cleanupLegacySeededDemoData
 } from '../services/firestore';
 import { useToast } from './ToastContext';
 
@@ -27,8 +30,11 @@ interface AuthContextValue {
   firebaseUser: FirebaseUser | null;
   loading: boolean;
   isAdmin: boolean;
+  isAssistantAdmin: boolean;
+  isRoomLeader: boolean;
   isOwner: boolean;
   isStaff: boolean;
+  roleRank: number;
   onlineCount: number;
   onlineUsers: PresenceRecord[];
   loginWithGoogle: () => Promise<void>;
@@ -50,8 +56,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const { showToast } = useToast();
 
   const heartbeatIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const cleanupRanRef = useRef(false);
 
-  // Refresh current user profile from Firestore
   const refreshProfile = useCallback(async () => {
     if (!currentUser?.id) return;
     try {
@@ -64,7 +70,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [currentUser?.id]);
 
-  // Handle Firebase Auth changes
   useEffect(() => {
     testConnection();
 
@@ -79,8 +84,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             photoURL: fbUser.photoURL,
           });
           setCurrentUser(profile);
-          // Initial presence heartbeat
           await sendPresenceHeartbeat(profile.id, profile.displayName, profile.photoURL, true);
+
+          if ((profile.role === 'owner' || profile.role === 'admin') && !cleanupRanRef.current) {
+            cleanupRanRef.current = true;
+            void cleanupLegacySeededDemoData();
+          }
         } catch (err) {
           console.error('Error syncing user profile on auth change:', err);
         }
@@ -93,7 +102,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => unsubscribe();
   }, []);
 
-  // Presence heartbeat loop when logged in
   useEffect(() => {
     if (!currentUser?.id) {
       if (heartbeatIntervalRef.current) {
@@ -103,10 +111,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    // Immediate heartbeat
     sendPresenceHeartbeat(currentUser.id, currentUser.displayName, currentUser.photoURL, true);
 
-    // Heartbeat every 45 seconds to keep user actively counted
     heartbeatIntervalRef.current = setInterval(() => {
       sendPresenceHeartbeat(currentUser.id, currentUser.displayName, currentUser.photoURL, true);
     }, 45000);
@@ -126,7 +132,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [currentUser?.id, currentUser?.displayName, currentUser?.photoURL]);
 
-  // Real presence listener: real-time verified active presence, no fake counts
   useEffect(() => {
     const unsubPresence = listenToActivePresence((activeList, totalActive) => {
       setOnlineUsers(activeList);
@@ -136,14 +141,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => unsubPresence();
   }, []);
 
-  // Google Sign-In
   const loginWithGoogle = async () => {
     try {
       setLoading(true);
       const provider = new GoogleAuthProvider();
       provider.setCustomParameters({ prompt: 'select_account' });
       const result = await signInWithPopup(auth, provider);
-      
+
       const profile = await syncUserProfile({
         uid: result.user.uid,
         email: result.user.email,
@@ -152,11 +156,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
 
       setCurrentUser(profile);
-      showToast(`مرحباً بك في مجتمع Q، ${profile.displayName}. ✨`, 'success');
+      showToast(`مرحباً بك في منصة Q، ${profile.displayName}. ✨`, 'success');
     } catch (err: any) {
       console.error('Google Sign-In Error:', err);
       if (err.code === 'auth/popup-closed-by-user') {
-        // User closed the popup, silent
+        // Silent cancel
       } else if (err.code === 'auth/network-request-failed' || err.code === 'auth/popup-blocked') {
         showToast('تم حظر النافذة المنبثقة من قِبل المتصفح. يمكنك تسجيل الدخول بالبريد الإلكتروني وكلمة المرور.', 'info');
       } else {
@@ -168,7 +172,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  // Real Email & Password Login
   const loginWithEmail = async (email: string, pass: string) => {
     try {
       setLoading(true);
@@ -196,7 +199,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  // Real Email & Password Registration
   const registerWithEmail = async (email: string, pass: string, displayName: string) => {
     try {
       setLoading(true);
@@ -209,7 +211,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         photoURL: undefined,
       });
       setCurrentUser(profile);
-      showToast(`تم إنشاء حسابك في مجتمع Q بنجاح، أهلاً بك يا ${displayName.trim()}! 🎉`, 'success');
+      showToast(`تم إنشاء حسابك في منصة Q بنجاح، أهلاً بك يا ${displayName.trim()}! 🎉`, 'success');
     } catch (err: any) {
       console.error('Email Registration Error:', err);
       let message = 'تعذر إنشاء الحساب.';
@@ -225,7 +227,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  // Sign out
   const logout = async () => {
     if (currentUser?.id) {
       await sendPresenceHeartbeat(currentUser.id, currentUser.displayName, currentUser.photoURL, false);
@@ -235,10 +236,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     showToast('تم تسجيل الخروج من منصة Q.', 'info');
   };
 
-  // Dynamic Role-Based Access Control (RBAC) - verified strictly against Firestore role document
-  const isAdmin = currentUser?.role === 'admin' || currentUser?.role === 'owner';
-  const isOwner = currentUser?.role === 'owner';
-  const isStaff = !!isAdmin || !!isOwner || currentUser?.role === 'moderator';
+  const role: UserRole = currentUser?.role || 'user';
+  const roleRank = getRoleRank(role);
+  const isOwner = role === 'owner';
+  const isAdmin = role === 'admin' || role === 'owner';
+  const isAssistantAdmin = roleRank >= getRoleRank('assistant_admin');
+  const isRoomLeader = roleRank >= getRoleRank('room_leader');
+  const isStaff = roleRank >= getRoleRank('moderator');
 
   return (
     <AuthContext.Provider
@@ -246,9 +250,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         currentUser,
         firebaseUser,
         loading,
-        isAdmin: !!isAdmin,
-        isOwner: !!isOwner,
-        isStaff: !!isStaff,
+        isAdmin,
+        isAssistantAdmin,
+        isRoomLeader,
+        isOwner,
+        isStaff,
+        roleRank,
         onlineCount,
         onlineUsers,
         loginWithGoogle,

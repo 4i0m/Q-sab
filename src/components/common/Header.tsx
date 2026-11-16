@@ -1,131 +1,139 @@
-import { Search, Bell, Settings, Globe } from 'lucide-react';
+import { Search, Bell, Settings, Globe, Menu } from 'lucide-react';
 import { ActiveTab } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { QLogo } from './QLogo';
+import { MediaImage } from './MediaImage';
 
 interface HeaderProps {
   activeTab: ActiveTab;
   setActiveTab: (tab: ActiveTab) => void;
+  onOpenDrawer: () => void;
   unreadNotificationsCount?: number;
 }
 
 export function Header({
   activeTab,
   setActiveTab,
+  onOpenDrawer,
   unreadNotificationsCount = 0,
 }: HeaderProps) {
   const { currentUser, onlineCount } = useAuth();
   const { language, setLanguage, t } = useLanguage();
 
   const toggleLanguage = () => {
-    setLanguage(language === 'ar' ? 'en' : 'ar');
+    const order: Array<'ar' | 'en' | 'tr'> = ['ar', 'en', 'tr'];
+    const next = order[(order.indexOf(language) + 1) % order.length];
+    setLanguage(next);
   };
 
   return (
-    <header className="sticky top-0 z-40 w-full bg-[#0B0F19]/90 backdrop-blur-xl border-b border-[#2A2F3A]">
-      <div className="max-w-md mx-auto px-4 h-14 flex items-center justify-between">
-        
-        {/* Left: User Avatar or Q Brand Link */}
-        <div className="flex items-center gap-2.5">
+    <header className="sticky top-0 z-40 w-full bg-white/90 dark:bg-[#0B0F19]/90 backdrop-blur-xl border-b border-slate-200 dark:border-[#2A2F3A] transition-colors">
+      <div className="max-w-md mx-auto px-3 sm:px-4 h-14 flex items-center justify-between gap-2">
+        {/* Start corner: Profile Avatar button that opens X-style Navigation Drawer */}
+        <div className="flex items-center gap-2 min-w-0">
           {currentUser ? (
             <button
-              onClick={() => setActiveTab('profile')}
-              className="relative w-8 h-8 rounded-full overflow-hidden border border-[#3B6DFF]/60 hover:border-[#4F8CFF] transition-all shrink-0 cursor-pointer"
-              title="الملف الشخصي"
+              type="button"
+              onClick={onOpenDrawer}
+              className="relative w-9 h-9 rounded-full overflow-hidden border border-[#3B6DFF]/60 hover:border-[#4F8CFF] transition-all shrink-0 cursor-pointer active:scale-95"
+              title="القائمة الجانبية"
+              aria-label="فتح القائمة الجانبية"
             >
-              <img
-                src={
-                  currentUser.photoURL ||
-                  `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(
-                    currentUser.displayName
-                  )}`
-                }
+              <MediaImage
+                src={currentUser.photoURL}
                 alt={currentUser.displayName}
+                variant="avatar"
+                fallbackText={currentUser.displayName}
+                containerClassName="w-full h-full rounded-full overflow-hidden"
                 className="w-full h-full object-cover"
               />
             </button>
           ) : (
             <button
-              onClick={() => setActiveTab('feed')}
-              className="flex items-center gap-1.5 group active:scale-95 transition-transform"
+              type="button"
+              onClick={onOpenDrawer}
+              className="w-9 h-9 rounded-xl bg-slate-100 dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] flex items-center justify-center text-slate-700 dark:text-slate-200 hover:border-[#3B6DFF] transition-colors shrink-0 cursor-pointer"
+              aria-label="فتح القائمة"
             >
-              <QLogo size={28} />
+              <Menu className="w-4 h-4" />
             </button>
           )}
 
-          {/* Real verified presence badge in cyan */}
-          <div className="hidden xs:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#161B26] border border-[#2A2F3A] text-[10px] text-[#94A3B8] font-mono-subtle">
-            <span className="w-1.5 h-1.5 rounded-full bg-[#4F8CFF] animate-pulse"></span>
-            <span>{onlineCount} {t('activeNow')}</span>
+          <div className="hidden xs:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] text-[10px] text-slate-600 dark:text-[#94A3B8] font-mono-subtle tabular-nums shrink-0">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+            <span>
+              {onlineCount} {t('activeNow')}
+            </span>
           </div>
         </div>
 
-        {/* Center: Clean Q Logo matching Screen 2 */}
-        <div className="flex items-center justify-center">
+        {/* Center: Clean Q Logo */}
+        <div className="flex items-center justify-center shrink-0">
           <button
+            type="button"
             onClick={() => setActiveTab('feed')}
             className="flex items-center gap-2 group cursor-pointer active:scale-95 transition-transform"
+            aria-label={t('home')}
           >
             <QLogo size={32} />
           </button>
         </div>
 
-        {/* Action Icons matching Screen 2 & 8: Search, Notifications, Settings, Language */}
-        <div className="flex items-center gap-1">
-          {/* Language Toggle */}
+        {/* Actions: Language, Search, Notifications, Settings */}
+        <div className="flex items-center gap-1 shrink-0">
           <button
+            type="button"
             onClick={toggleLanguage}
-            className="flex items-center gap-1 px-2 py-1 rounded-xl bg-[#161B26] hover:bg-[#1E1E2E] border border-[#2A2F3A] text-[11px] font-tajawal text-[#94A3B8] hover:text-white transition-colors cursor-pointer"
-            title="تبديل اللغة / Switch Language"
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-100 dark:bg-[#161B26] hover:bg-slate-200 dark:hover:bg-[#1E1E2E] border border-slate-200 dark:border-[#2A2F3A] text-[11px] font-handle font-semibold text-slate-700 dark:text-[#94A3B8] hover:text-slate-900 dark:hover:text-white transition-colors cursor-pointer shrink-0 whitespace-nowrap"
+            title={t('language')}
           >
-            <Globe className="w-3.5 h-3.5 text-[#4F8CFF]" />
-            <span>{language === 'ar' ? 'EN' : 'عربي'}</span>
+            <Globe className="w-3.5 h-3.5 text-[#3B6DFF] dark:text-[#4F8CFF]" />
+            <span>{language === 'ar' ? 'AR' : language === 'en' ? 'EN' : 'TR'}</span>
           </button>
 
-          {/* Search Icon */}
           <button
+            type="button"
             onClick={() => setActiveTab('explore')}
             className={`p-2 rounded-xl transition-all cursor-pointer active:scale-90 ${
               activeTab === 'explore'
-                ? 'text-[#4F8CFF] bg-[#3B6DFF]/15 border border-[#3B6DFF]/30'
-                : 'text-[#94A3B8] hover:text-white hover:bg-[#161B26]'
+                ? 'text-[#3B6DFF] dark:text-[#4F8CFF] bg-[#3B6DFF]/10 dark:bg-[#3B6DFF]/15 border border-[#3B6DFF]/30'
+                : 'text-slate-600 dark:text-[#94A3B8] hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-[#161B26]'
             }`}
             aria-label={t('explore')}
           >
             <Search className="w-4 h-4 stroke-[2]" />
           </button>
 
-          {/* Notifications Icon with Electric Blue Badge */}
           <button
+            type="button"
             onClick={() => setActiveTab('notifications')}
             className={`relative p-2 rounded-xl transition-all cursor-pointer active:scale-90 ${
               activeTab === 'notifications'
-                ? 'text-[#4F8CFF] bg-[#3B6DFF]/15 border border-[#3B6DFF]/30'
-                : 'text-[#94A3B8] hover:text-white hover:bg-[#161B26]'
+                ? 'text-[#3B6DFF] dark:text-[#4F8CFF] bg-[#3B6DFF]/10 dark:bg-[#3B6DFF]/15 border border-[#3B6DFF]/30'
+                : 'text-slate-600 dark:text-[#94A3B8] hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-[#161B26]'
             }`}
             aria-label={t('notifications')}
           >
             <Bell className="w-4 h-4 stroke-[2]" />
             {unreadNotificationsCount > 0 && (
-              <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#3B6DFF] ring-2 ring-[#0B0F19]" />
+              <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#3B6DFF] ring-2 ring-white dark:ring-[#0B0F19]" />
             )}
           </button>
 
-          {/* Settings Icon */}
           <button
+            type="button"
             onClick={() => setActiveTab('settings')}
             className={`p-2 rounded-xl transition-all cursor-pointer active:scale-90 ${
               activeTab === 'settings'
-                ? 'text-[#4F8CFF] bg-[#3B6DFF]/15 border border-[#3B6DFF]/30'
-                : 'text-[#94A3B8] hover:text-white hover:bg-[#161B26]'
+                ? 'text-[#3B6DFF] dark:text-[#4F8CFF] bg-[#3B6DFF]/10 dark:bg-[#3B6DFF]/15 border border-[#3B6DFF]/30'
+                : 'text-slate-600 dark:text-[#94A3B8] hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-[#161B26]'
             }`}
             aria-label={t('settings')}
           >
             <Settings className="w-4 h-4 stroke-[2]" />
           </button>
         </div>
-
       </div>
     </header>
   );

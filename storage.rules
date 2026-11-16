@@ -1,23 +1,28 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
-    
+
     function isSignedIn() {
       return request.auth != null;
     }
-    
+
     function isOwner(userId) {
       return isSignedIn() && request.auth.uid == userId;
     }
-    
+
     function isValidImage() {
       return request.resource.contentType.matches('image/.*')
         && request.resource.size <= 10 * 1024 * 1024;
     }
-    
+
     function isValidVideo() {
       return request.resource.contentType.matches('video/.*')
         && request.resource.size <= 30 * 1024 * 1024;
+    }
+
+    function isValidAudio() {
+      return request.resource.contentType.matches('audio/.*')
+        && request.resource.size <= 10 * 1024 * 1024;
     }
 
     // User post media (images & videos)
@@ -42,17 +47,37 @@ service firebase.storage {
       allow delete: if isOwner(userId);
     }
 
-    // Stories media (24-hour stories)
+    // Group avatars, covers & group post media
+    match /groups/{userId}/{fileName} {
+      allow read: if true;
+      allow create, update: if isOwner(userId) && (isValidImage() || isValidVideo());
+      allow delete: if isOwner(userId);
+    }
+
+    // Stories media (24-hour stories: images & videos)
     match /stories/{userId}/{fileName} {
       allow read: if true;
       allow create: if isOwner(userId) && (isValidImage() || isValidVideo());
       allow delete: if isOwner(userId);
     }
 
+    // Direct & group chat media (images, videos, voice notes)
+    match /chats/{userId}/{fileName} {
+      allow read: if isSignedIn();
+      allow create, update: if isOwner(userId) && (isValidImage() || isValidVideo() || isValidAudio());
+      allow delete: if isOwner(userId);
+    }
+
+    // Voice note audio recordings
+    match /audio/{userId}/{fileName} {
+      allow read: if isSignedIn();
+      allow create, update: if isOwner(userId) && isValidAudio();
+      allow delete: if isOwner(userId);
+    }
+
     // Default deny for unmapped paths
     match /{allPaths=**} {
-      allow read: if true;
-      allow write: if false;
+      allow read, write: if false;
     }
   }
 }

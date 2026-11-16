@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
 @layer base {
   :root {
@@ -25,28 +26,37 @@
   body {
     background-color: var(--bg-midnight);
     color: var(--text-primary);
-    font-family: 'Plus Jakarta Sans', 'Tajawal', 'Cairo', system-ui, -apple-system, sans-serif;
+    font-family: 'Manrope', 'Plus Jakarta Sans', 'IBM Plex Sans Arabic', 'Tajawal', system-ui, -apple-system, sans-serif;
     overflow-x: hidden;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
     transition: background-color 0.25s ease, color 0.25s ease;
   }
 }
 
-.font-cairo {
-  font-family: 'Cairo', sans-serif;
+.font-display-en {
+  font-family: 'Manrope', 'Plus Jakarta Sans', system-ui, sans-serif;
+  letter-spacing: -0.015em;
 }
 
+.font-ar,
 .font-tajawal {
-  font-family: 'Tajawal', sans-serif;
+  font-family: 'IBM Plex Sans Arabic', 'Tajawal', system-ui, sans-serif;
 }
 
 .font-jakarta {
-  font-family: 'Plus Jakarta Sans', sans-serif;
+  font-family: 'Manrope', 'Plus Jakarta Sans', system-ui, sans-serif;
+}
+
+.font-handle {
+  font-family: 'Manrope', 'Plus Jakarta Sans', 'IBM Plex Sans Arabic', sans-serif;
+  letter-spacing: -0.01em;
+  font-feature-settings: "tnum" on, "lnum" on;
 }
 
 .font-mono-subtle {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'JetBrains Mono', 'Manrope', monospace;
 }
 
 /* Custom Scrollbar */
@@ -95,4 +105,23 @@
 
 .cyan-glow {
   box-shadow: 0 0 15px rgba(79, 140, 255, 0.3);
+}
+
+/* Subtle Private Chat Interior Background */
+.chat-canvas-pattern {
+  background-color: #f4f7fb;
+  background-image:
+    radial-gradient(at 18% 12%, rgba(59, 109, 255, 0.08) 0px, transparent 52%),
+    radial-gradient(at 84% 86%, rgba(56, 189, 248, 0.07) 0px, transparent 50%),
+    radial-gradient(rgba(15, 23, 42, 0.055) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 22px 22px;
+}
+
+.dark .chat-canvas-pattern {
+  background-color: #090d16;
+  background-image:
+    radial-gradient(at 16% 10%, rgba(59, 109, 255, 0.14) 0px, transparent 52%),
+    radial-gradient(at 85% 88%, rgba(79, 140, 255, 0.09) 0px, transparent 52%),
+    radial-gradient(rgba(148, 163, 184, 0.075) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 22px 22px;
 }

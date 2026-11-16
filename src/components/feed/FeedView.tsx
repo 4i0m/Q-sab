@@ -1,39 +1,30 @@
 import { useState, useEffect } from 'react';
-import { Plus, Image, Video, Users, Sparkles, Filter } from 'lucide-react';
+import { Plus, Image, FileText, BarChart3 } from 'lucide-react';
 import { Post, FollowRelationship } from '../../types';
 import { listenToPosts, listenToUserFollowing } from '../../services/firestore';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { PostCard } from './PostCard';
 import { StoriesBar } from '../stories/StoriesBar';
+import { CreatePostInitialMode } from './CreatePostModal';
+import { MediaImage } from '../common/MediaImage';
 
 interface FeedViewProps {
-  onOpenCreatePost: () => void;
+  onOpenCreatePost: (mode?: CreatePostInitialMode) => void;
   onSelectAuthor: (authorId: string) => void;
+  onSelectPost?: (post: Post) => void;
 }
 
-type FeedTab = 'forYou' | 'following' | 'communities' | 'media';
+type FeedTab = 'forYou' | 'following' | 'blogs' | 'questions' | 'media';
 
-const COMMUNITIES = [
-  'الكل',
-  'القرآن الكريم',
-  'التقنية والذكاء الاصطناعي',
-  'التطوير الذاتي والفكر',
-  'العلوم والمعرفة',
-  'التصميم والفنون',
-  'عام',
-];
-
-export function FeedView({ onOpenCreatePost, onSelectAuthor }: FeedViewProps) {
-  const { currentUser } = useAuth();
+export function FeedView({ onOpenCreatePost, onSelectAuthor, onSelectPost }: FeedViewProps) {
+  const { currentUser, isStaff } = useAuth();
   const { t } = useLanguage();
   const [posts, setPosts] = useState<Post[]>([]);
   const [feedTab, setFeedTab] = useState<FeedTab>('forYou');
-  const [selectedCommunity, setSelectedCommunity] = useState<string>('الكل');
   const [followingList, setFollowingList] = useState<FollowRelationship[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Listen to all posts in real-time
   useEffect(() => {
     const unsub = listenToPosts((loadedPosts) => {
       setPosts(loadedPosts);
@@ -47,7 +38,6 @@ export function FeedView({ onOpenCreatePost, onSelectAuthor }: FeedViewProps) {
     };
   }, []);
 
-  // Listen to current user's followed accounts for "المتابعون" filter
   useEffect(() => {
     if (!currentUser?.id) {
       setFollowingList([]);
@@ -59,187 +49,160 @@ export function FeedView({ onOpenCreatePost, onSelectAuthor }: FeedViewProps) {
     return () => unsub();
   }, [currentUser?.id]);
 
-  // Compute filtered posts based on active tab
+  const followedIds = new Set(followingList.map((f) => f.followingId));
+
   const filteredPosts = posts.filter((post) => {
+    if (post.visibility === 'followers_only') {
+      const canViewPrivatePost =
+        Boolean(currentUser?.id && currentUser.id === post.authorId) ||
+        followedIds.has(post.authorId) ||
+        isStaff;
+      if (!canViewPrivatePost) return false;
+    }
+
     if (feedTab === 'following') {
       if (!currentUser?.id) return false;
-      const followedIds = new Set(followingList.map((f) => f.followingId));
-      // Show user's own posts + followed accounts
       return followedIds.has(post.authorId) || post.authorId === currentUser.id;
     }
 
-    if (feedTab === 'communities') {
-      if (selectedCommunity === 'الكل') return true;
-      return post.community === selectedCommunity;
+    if (feedTab === 'blogs') {
+      return post.postType === 'blog' || post.postType === 'wiki';
+    }
+
+    if (feedTab === 'questions') {
+      return post.postType === 'question' || post.postType === 'poll' || post.postType === 'quiz';
     }
 
     if (feedTab === 'media') {
-      return Boolean(post.mediaURL);
+      return Boolean(
+        post.mediaURL ||
+          post.videoURL ||
+          (post.mediaURLs && post.mediaURLs.length > 0)
+      );
     }
 
-    return true; // 'forYou'
+    return true;
   });
+
+  const tabs: Array<{ id: FeedTab; label: string }> = [
+    { id: 'forYou', label: t('forYou') },
+    { id: 'following', label: t('following') },
+    { id: 'blogs', label: 'مدونات وويكي' },
+    { id: 'questions', label: 'أسئلة واستطلاعات' },
+    { id: 'media', label: t('media') },
+  ];
 
   return (
     <div className="w-full max-w-md mx-auto pb-24 space-y-3.5">
-      
-      {/* 1. Top Tabs: لك | المتابعون | المجتمعات | الوسائط */}
-      <div className="flex items-center justify-between border-b border-[#2A2F3A] px-2 pt-0.5 pb-2">
-        <button
-          onClick={() => setFeedTab('forYou')}
-          className={`relative pb-1.5 text-xs sm:text-sm font-bold font-tajawal transition-colors cursor-pointer ${
-            feedTab === 'forYou' ? 'text-[#3B6DFF]' : 'text-[#94A3B8] hover:text-white'
-          }`}
-        >
-          <span>{t('forYou')}</span>
-          {feedTab === 'forYou' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#3B6DFF] rounded-full shadow-sm shadow-[#3B6DFF]/50" />
-          )}
-        </button>
-
-        <button
-          onClick={() => setFeedTab('following')}
-          className={`relative pb-1.5 text-xs sm:text-sm font-bold font-tajawal transition-colors cursor-pointer ${
-            feedTab === 'following' ? 'text-[#3B6DFF]' : 'text-[#94A3B8] hover:text-white'
-          }`}
-        >
-          <span>{t('following')}</span>
-          {feedTab === 'following' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#3B6DFF] rounded-full shadow-sm shadow-[#3B6DFF]/50" />
-          )}
-        </button>
-
-        <button
-          onClick={() => setFeedTab('communities')}
-          className={`relative pb-1.5 text-xs sm:text-sm font-bold font-tajawal transition-colors cursor-pointer ${
-            feedTab === 'communities' ? 'text-[#3B6DFF]' : 'text-[#94A3B8] hover:text-white'
-          }`}
-        >
-          <span>المجتمعات</span>
-          {feedTab === 'communities' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#3B6DFF] rounded-full shadow-sm shadow-[#3B6DFF]/50" />
-          )}
-        </button>
-
-        <button
-          onClick={() => setFeedTab('media')}
-          className={`relative pb-1.5 text-xs sm:text-sm font-bold font-tajawal transition-colors cursor-pointer ${
-            feedTab === 'media' ? 'text-[#3B6DFF]' : 'text-[#94A3B8] hover:text-white'
-          }`}
-        >
-          <span>الوسائط</span>
-          {feedTab === 'media' && (
-            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#3B6DFF] rounded-full shadow-sm shadow-[#3B6DFF]/50" />
-          )}
-        </button>
+      {/* Top Global Feed Tabs */}
+      <div className="flex items-center gap-4 overflow-x-auto scrollbar-none border-b border-slate-200 dark:border-[#2A2F3A] px-2 pt-0.5 pb-2">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setFeedTab(tab.id)}
+            className={`relative pb-1.5 text-xs sm:text-sm font-bold font-tajawal shrink-0 transition-colors cursor-pointer ${
+              feedTab === tab.id
+                ? 'text-[#3B6DFF]'
+                : 'text-slate-500 dark:text-[#94A3B8] hover:text-slate-900 dark:hover:text-white'
+            }`}
+          >
+            <span>{tab.label}</span>
+            {feedTab === tab.id && (
+              <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#3B6DFF] rounded-full shadow-sm shadow-[#3B6DFF]/50" />
+            )}
+          </button>
+        ))}
       </div>
 
-      {/* Community Pills Selector (Visible when 'المجتمعات' is active) */}
-      {feedTab === 'communities' && (
-        <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none pt-1">
-          {COMMUNITIES.map((comm) => (
-            <button
-              key={comm}
-              onClick={() => setSelectedCommunity(comm)}
-              className={`px-3 py-1 rounded-xl text-xs font-tajawal font-bold shrink-0 transition-all cursor-pointer ${
-                selectedCommunity === comm
-                  ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-                  : 'bg-[#161B26] border border-[#2A2F3A] text-[#94A3B8] hover:text-white'
-              }`}
-            >
-              {comm}
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* 2. "ماذا يدور في بالك؟" Quick Create Post Box matching Reference Images */}
-      <div className="bg-[#161B26] border border-[#2A2F3A] rounded-2xl p-3.5 shadow-xl space-y-3">
+      {/* Quick Create Post Box */}
+      <div className="bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] rounded-2xl p-3.5 shadow-sm dark:shadow-xl space-y-3">
         <div className="flex items-center gap-3">
-          <div className="relative w-10 h-10 rounded-full overflow-hidden bg-[#1E1E2E] shrink-0 border border-[#3B6DFF]/40">
-            <img
-              src={
-                currentUser?.photoURL ||
-                `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(
-                  currentUser?.displayName || 'Q User'
-                )}`
-              }
-              alt=""
+          <div className="relative w-10 h-10 rounded-full overflow-hidden bg-slate-100 dark:bg-[#1E1E2E] shrink-0 border border-[#3B6DFF]/40">
+            <MediaImage
+              src={currentUser?.photoURL}
+              alt={currentUser?.displayName || 'Q'}
+              variant="avatar"
+              fallbackText={currentUser?.displayName || 'Q'}
+              containerClassName="w-full h-full rounded-full overflow-hidden"
               className="w-full h-full object-cover"
             />
           </div>
 
           <button
-            onClick={onOpenCreatePost}
-            className="flex-1 text-start px-4 py-2.5 rounded-full bg-[#0B0F19] hover:bg-[#1E1E2E] border border-[#2A2F3A] text-[#94A3B8] hover:text-[#F8FAFC] text-xs font-tajawal transition-colors cursor-pointer"
+            onClick={() => onOpenCreatePost('post')}
+            className="flex-1 text-start px-4 py-2.5 rounded-full bg-slate-100 dark:bg-[#0B0F19] hover:bg-slate-200/80 dark:hover:bg-[#1E1E2E] border border-slate-200 dark:border-[#2A2F3A] text-slate-500 dark:text-[#94A3B8] hover:text-slate-900 dark:hover:text-[#F8FAFC] text-xs font-tajawal transition-colors cursor-pointer"
           >
             ماذا يدور في بالك؟...
           </button>
         </div>
 
-        {/* Quick action buttons: صورة | فيديو | مجتمع */}
-        <div className="flex items-center justify-around pt-2 border-t border-[#2A2F3A]/60 text-xs font-tajawal text-[#94A3B8]">
+        <div className="flex items-center justify-around pt-2 border-t border-slate-100 dark:border-[#2A2F3A]/60 text-xs font-tajawal text-slate-600 dark:text-[#94A3B8]">
           <button
-            onClick={onOpenCreatePost}
-            className="flex items-center gap-1.5 hover:text-[#4F8CFF] transition-colors py-1 px-2.5 rounded-xl hover:bg-[#1E1E2E] cursor-pointer"
+            onClick={() => onOpenCreatePost('image')}
+            className="flex items-center gap-1.5 hover:text-[#3B6DFF] dark:hover:text-[#4F8CFF] transition-colors py-1 px-2.5 rounded-xl hover:bg-slate-100 dark:hover:bg-[#1E1E2E] cursor-pointer"
           >
-            <Image className="w-4 h-4 text-[#4F8CFF]" />
-            <span>صورة</span>
+            <Image className="w-4 h-4 text-[#3B6DFF] dark:text-[#4F8CFF]" />
+            <span>صور / فيديو</span>
           </button>
 
           <button
-            onClick={onOpenCreatePost}
-            className="flex items-center gap-1.5 hover:text-[#4F8CFF] transition-colors py-1 px-2.5 rounded-xl hover:bg-[#1E1E2E] cursor-pointer"
+            onClick={() => onOpenCreatePost('blog')}
+            className="flex items-center gap-1.5 hover:text-[#3B6DFF] dark:hover:text-[#4F8CFF] transition-colors py-1 px-2.5 rounded-xl hover:bg-slate-100 dark:hover:bg-[#1E1E2E] cursor-pointer"
           >
-            <Video className="w-4 h-4 text-[#38BDF8]" />
-            <span>فيديو</span>
+            <FileText className="w-4 h-4 text-[#38BDF8]" />
+            <span>مدونة / ويكي</span>
           </button>
 
           <button
-            onClick={() => {
-              setFeedTab('communities');
-            }}
-            className="flex items-center gap-1.5 hover:text-[#4F8CFF] transition-colors py-1 px-2.5 rounded-xl hover:bg-[#1E1E2E] cursor-pointer"
+            onClick={() => onOpenCreatePost('poll')}
+            className="flex items-center gap-1.5 hover:text-[#3B6DFF] dark:hover:text-[#4F8CFF] transition-colors py-1 px-2.5 rounded-xl hover:bg-slate-100 dark:hover:bg-[#1E1E2E] cursor-pointer"
           >
-            <Users className="w-4 h-4 text-[#818CF8]" />
-            <span>مجتمع</span>
+            <BarChart3 className="w-4 h-4 text-[#818CF8]" />
+            <span>استطلاع / سؤال</span>
           </button>
         </div>
       </div>
 
-      {/* 3. Stories Bar Carousel */}
+      {/* Stories Bar Carousel */}
       <div className="pt-0.5">
-        <StoriesBar />
+        <StoriesBar onSelectAuthor={onSelectAuthor} />
       </div>
 
-      {/* 4. Posts Stream */}
+      {/* Posts Stream */}
       <div className="space-y-3.5 pt-1">
         {loading ? (
           <div className="space-y-4">
             {[1, 2].map((i) => (
-              <div key={i} className="h-56 rounded-2xl bg-[#161B26]/60 animate-pulse border border-[#2A2F3A]" />
+              <div key={i} className="h-56 rounded-2xl bg-slate-200/70 dark:bg-[#161B26]/60 animate-pulse border border-slate-200 dark:border-[#2A2F3A]" />
             ))}
           </div>
         ) : filteredPosts.length > 0 ? (
           filteredPosts.map((post) => (
-            <PostCard key={post.id} post={post} onSelectAuthor={onSelectAuthor} />
+            <PostCard
+              key={post.id}
+              post={post}
+              onSelectAuthor={onSelectAuthor}
+              onSelectPost={onSelectPost}
+            />
           ))
         ) : (
-          <div className="py-14 text-center bg-[#161B26] border border-[#2A2F3A] rounded-2xl p-6 space-y-2">
-            <h4 className="text-base font-bold text-white font-tajawal">
+          <div className="py-14 text-center bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] rounded-2xl p-6 space-y-2 shadow-sm">
+            <h4 className="text-base font-bold text-slate-900 dark:text-white font-tajawal">
               {feedTab === 'following'
                 ? 'لا توجد منشورات من الحسابات التي تتابعها'
-                : feedTab === 'communities'
-                ? `لا توجد منشورات في مجتمع "${selectedCommunity}" حالياً`
+                : feedTab === 'blogs'
+                ? 'لا توجد مدونات أو صفحات ويكي بعد'
+                : feedTab === 'questions'
+                ? 'لا توجد أسئلة أو استطلاعات بعد'
                 : 'مرحباً بك في مجتمع Q'}
             </h4>
-            <p className="text-xs text-[#94A3B8] max-w-xs mx-auto font-tajawal">
+            <p className="text-xs text-slate-500 dark:text-[#94A3B8] max-w-xs mx-auto font-tajawal">
               {feedTab === 'following'
-                ? 'تابع المستخدمين في تبويب "لك" أو "اكتشف" لتظهر منشوراتهم هنا في هذه الخلاصة.'
-                : 'كن أول من ينشر في هذه المساحة ويشارك أفكاره وتجاربه مع الآخرين.'}
+                ? 'تابع المستخدمين في تبويب "لك" أو "اكتشف" لتظهر منشوراتهم هنا.'
+                : 'كن أول من ينشر في هذه المساحة ويشارك أفكاره مع الجميع.'}
             </p>
             <button
-              onClick={onOpenCreatePost}
+              onClick={() => onOpenCreatePost('post')}
               className="mt-3 px-6 py-2.5 rounded-xl bg-[#3B6DFF] hover:bg-[#2B5BE5] text-white text-xs font-bold font-tajawal shadow-lg shadow-[#3B6DFF]/25 active:scale-95 transition-all cursor-pointer"
             >
               {t('publishPost')}
@@ -248,17 +211,16 @@ export function FeedView({ onOpenCreatePost, onSelectAuthor }: FeedViewProps) {
         )}
       </div>
 
-      {/* 5. Floating Action Button matching reference images */}
+      {/* Floating Action Button */}
       <div className="fixed bottom-20 end-4 sm:end-8 z-30">
         <button
-          onClick={onOpenCreatePost}
+          onClick={() => onOpenCreatePost('post')}
           className="w-12 h-12 rounded-full bg-[#3B6DFF] hover:bg-[#2B5BE5] text-white flex items-center justify-center shadow-xl shadow-[#3B6DFF]/40 hover:scale-105 active:scale-90 transition-transform border border-[#4F8CFF]/40 cursor-pointer"
           aria-label={t('publishPost')}
         >
           <Plus className="w-6 h-6 stroke-[3]" />
         </button>
       </div>
-
     </div>
   );
 }
