@@ -27,6 +27,7 @@ import { VerifiedBadge } from '../common/VerifiedBadge';
 import { formatRelativeTime } from '../../utils/date';
 import { useToast } from '../../context/ToastContext';
 import { MediaImage } from '../common/MediaImage';
+import { useLiveUserProfile, useLiveUserProfiles } from '../../hooks/useUserProfiles';
 
 interface StoryViewerModalProps {
   stories: Story[];
@@ -67,6 +68,21 @@ export function StoryViewerModal({
   const currentStory = stories[currentIndex];
   const isAuthor = Boolean(currentUser?.id && currentStory && currentUser.id === currentStory.authorId);
   const canSeeViewers = Boolean(currentStory && (isAuthor || isAdmin));
+
+  const liveAuthor = useLiveUserProfile(
+    currentStory?.authorId,
+    currentStory
+      ? {
+          displayName: currentStory.authorName,
+          handle: currentStory.authorHandle,
+          photoURL: currentStory.authorPhotoURL,
+          isVerified: currentStory.authorIsVerified,
+          verificationCategory: currentStory.authorVerificationCategory,
+        }
+      : undefined
+  );
+
+  const liveViewersMap = useLiveUserProfiles(viewerRecords.map((rec) => rec.viewerId));
 
   useEffect(() => {
     setCurrentIndex(initialIndex);
@@ -230,11 +246,8 @@ export function StoryViewerModal({
       const convId = await getOrCreateConversation(currentUser, authorProfile);
       await sendMessage(
         convId,
-        {
-          id: currentUser.id,
-          name: currentUser.displayName,
-          photoURL: currentUser.photoURL,
-        },
+        currentUser,
+        currentStory.authorId,
         `رد على قصتك: ${body}`
       );
       if (!textOverride) setReplyText('');
@@ -384,20 +397,20 @@ export function StoryViewerModal({
               className="flex items-center gap-2.5 min-w-0 text-start cursor-pointer group"
             >
               <MediaImage
-                src={currentStory.authorPhotoURL}
-                alt={currentStory.authorName}
+                src={liveAuthor.photoURL}
+                alt={liveAuthor.displayName}
                 variant="avatar"
-                fallbackText={currentStory.authorName}
+                fallbackText={liveAuthor.displayName}
                 containerClassName="w-9 h-9 rounded-full border-2 border-[#3B6DFF] overflow-hidden shrink-0"
                 className="w-full h-full object-cover"
               />
               <div className="min-w-0">
                 <div className="flex items-center gap-1">
                   <span className="text-xs font-bold text-white drop-shadow truncate group-hover:text-[#60A5FA] transition-colors">
-                    {currentStory.authorName}
+                    {liveAuthor.displayName}
                   </span>
-                  {Boolean(currentStory.authorIsVerified) && (
-                    <VerifiedBadge category={currentStory.authorVerificationCategory || 'blue'} className="w-3.5 h-3.5" />
+                  {Boolean(liveAuthor.isVerified) && (
+                    <VerifiedBadge category={liveAuthor.verificationCategory || 'blue'} className="w-3.5 h-3.5" interactive={false} />
                   )}
                 </div>
                 <div className="text-[10px] text-neutral-300 drop-shadow flex items-center gap-1">
@@ -506,7 +519,7 @@ export function StoryViewerModal({
                     onFocus={() => setIsTypingReply(true)}
                     onBlur={() => setIsTypingReply(false)}
                     onChange={(e) => setReplyText(e.target.value)}
-                    placeholder={`رد على ${currentStory.authorName}...`}
+                    placeholder={`رد على ${liveAuthor.displayName}...`}
                     maxLength={240}
                     className="flex-1 min-h-[38px] bg-white/15 border border-white/20 focus:border-[#4F8CFF] rounded-full px-3.5 text-xs text-white placeholder-white/60 focus:outline-none backdrop-blur-md"
                   />
@@ -576,7 +589,12 @@ export function StoryViewerModal({
 
               {viewerRecords.length > 0 ? (
                 <div className="space-y-2">
-                  {viewerRecords.map((rec) => (
+                  {viewerRecords.map((rec) => {
+                    const liveViewer = liveViewersMap[rec.viewerId];
+                    const viewerName = liveViewer ? liveViewer.displayName : (rec.displayName || 'مستخدم Q');
+                    const viewerHandle = liveViewer ? liveViewer.handle : (rec.handle || rec.viewerId.slice(0, 8));
+                    const viewerPhoto = liveViewer ? liveViewer.photoURL : rec.photoURL;
+                    return (
                     <button
                       key={rec.viewerId}
                       type="button"
@@ -590,19 +608,19 @@ export function StoryViewerModal({
                     >
                       <div className="flex items-center gap-2.5 min-w-0">
                         <MediaImage
-                          src={rec.photoURL}
-                          alt={rec.displayName || 'Q'}
+                          src={viewerPhoto}
+                          alt={viewerName}
                           variant="avatar"
-                          fallbackText={rec.displayName || rec.viewerId.slice(0, 2)}
+                          fallbackText={viewerName || rec.viewerId.slice(0, 2)}
                           containerClassName="w-7 h-7 rounded-full overflow-hidden border border-[#3B6DFF]/40 shrink-0"
                           className="w-full h-full object-cover"
                         />
                         <div className="min-w-0">
                           <p className="text-xs font-bold text-white truncate">
-                            {rec.displayName || 'مستخدم Q'}
+                            {viewerName}
                           </p>
                           <p className="text-[10px] text-neutral-400 font-mono truncate">
-                            @{rec.handle || rec.viewerId.slice(0, 8)}
+                            @{viewerHandle}
                           </p>
                         </div>
                       </div>
@@ -610,7 +628,8 @@ export function StoryViewerModal({
                         {formatRelativeTime(rec.viewedAt)}
                       </span>
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
               ) : (
                 <p className="text-xs text-neutral-400">لا توجد مشاهدات حتى الآن.</p>

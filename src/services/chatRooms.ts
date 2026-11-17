@@ -7,13 +7,16 @@ import {
   updateDoc,
   deleteDoc,
   query,
+  where,
   orderBy,
   limit,
   onSnapshot,
   increment,
   arrayUnion,
   arrayRemove,
-  Unsubscribe
+  Unsubscribe,
+  Query,
+  DocumentData
 } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from '../firebase/config';
 import {
@@ -41,36 +44,122 @@ export function listenToChatRooms(
   user: UserProfile | null,
   callback: (rooms: ChatRoom[]) => void
 ): Unsubscribe {
-  const path = 'chatRooms';
-  const q = query(collection(db, 'chatRooms'), limit(80));
+  const buckets = new Map<string, Map<string, ChatRoom>>();
+  const unsubs: Unsubscribe[] = [];
+
   const isStaff =
     user?.role === 'owner' ||
     user?.role === 'admin' ||
     user?.role === 'assistant_admin' ||
     user?.role === 'room_leader' ||
-    user?.role === 'moderator';
+    user?.role === 'moderator' ||
+    Boolean(user?.globalPermissions?.manageRooms);
 
+  const emitMerged = () => {
+    const merged = new Map<string, ChatRoom>();
+    buckets.forEach((bucketMap) => {
+      bucketMap.forEach((room, roomId) => {
+        merged.set(roomId, room);
+      });
+    });
+
+    const visible: ChatRoom[] = [];
+    merged.forEach((room) => {
+      if (user && (room.bannedUserIds || []).includes(user.id)) return;
+      const canSee =
+        room.visibility === 'public' ||
+        (user &&
+          (isStaff ||
+            room.ownerId === user.id ||
+            (room.leaderIds || []).includes(user.id) ||
+            (room.moderatorIds || []).includes(user.id) ||
+            (room.deputyIds || []).includes(user.id) ||
+            (room.allowedUserIds || []).includes(user.id)));
+      if (canSee) {
+        visible.push(room);
+      }
+    });
+
+    visible.sort((a, b) =>
+      (b.lastMessageAt || b.createdAt || '').localeCompare(a.lastMessageAt || a.createdAt || '')
+    );
+    callback(visible);
+  };
+
+  const attachBucket = (key: string, qRef: Query<DocumentData>) => {
+    buckets.set(key, new Map());
+    const unsub = onSnapshot(
+      qRef,
+      (snap) => {
+        const nextMap = new Map<string, ChatRoom>();
+        snap.forEach((d) => {
+          nextMap.set(d.id, { id: d.id, ...(d.data() as Record<string, any>) } as ChatRoom);
+        });
+        buckets.set(key, nextMap);
+        emitMerged();
+      },
+      () => {
+        buckets.set(key, new Map());
+        emitMerged();
+      }
+    );
+    unsubs.push(unsub);
+  };
+
+  attachBucket(
+    'public',
+    query(collection(db, 'chatRooms'), where('visibility', '==', 'public'), limit(300))
+  );
+
+  if (user?.id) {
+    attachBucket(
+      'owner',
+      query(collection(db, 'chatRooms'), where('ownerId', '==', user.id), limit(100))
+    );
+    attachBucket(
+      'allowed',
+      query(collection(db, 'chatRooms'), where('allowedUserIds', 'array-contains', user.id), limit(100))
+    );
+    attachBucket(
+      'leader',
+      query(collection(db, 'chatRooms'), where('leaderIds', 'array-contains', user.id), limit(100))
+    );
+    attachBucket(
+      'moderator',
+      query(collection(db, 'chatRooms'), where('moderatorIds', 'array-contains', user.id), limit(100))
+    );
+    attachBucket(
+      'deputy',
+      query(collection(db, 'chatRooms'), where('deputyIds', 'array-contains', user.id), limit(100))
+    );
+    if (isStaff) {
+      attachBucket('staff_all', query(collection(db, 'chatRooms'), limit(300)));
+    }
+  }
+
+  return () => {
+    unsubs.forEach((u) => {
+      try {
+        u();
+      } catch {
+        // ignore cleanup error
+      }
+    });
+  };
+}
+
+export function listenToAllChatRoomsForAdmin(
+  callback: (rooms: ChatRoom[]) => void
+): Unsubscribe {
+  const q = query(collection(db, 'chatRooms'), limit(200));
   return onSnapshot(
     q,
     (snap) => {
       const items: ChatRoom[] = [];
-      snap.forEach((d) => {
-        const room = { id: d.id, ...d.data() } as ChatRoom;
-        if (user && (room.bannedUserIds || []).includes(user.id)) return;
-        const canSee =
-          room.visibility === 'public' ||
-          (user &&
-            (isStaff ||
-              room.ownerId === user.id ||
-              (room.leaderIds || []).includes(user.id) ||
-              (room.moderatorIds || []).includes(user.id) ||
-              (room.deputyIds || []).includes(user.id) ||
-              (room.allowedUserIds || []).includes(user.id)));
-        if (canSee) {
-          items.push(room);
-        }
-      });
-      items.sort((a, b) => (b.lastMessageAt || b.createdAt).localeCompare(a.lastMessageAt || a.createdAt));
+      snap.forEach((d) => items.push({ id: d.id, ...(d.data() as Record<string, any>) } as ChatRoom));
+      items.sort((a, b) =>
+        (b.lastMessageAt || b.createdAt || '').localeCompare(a.lastMessageAt || a.createdAt || '')
+      );
       callback(items);
     },
     () => callback([])
@@ -268,10 +357,14 @@ export async function sendChatRoomMessage(
   sender: UserProfile,
   payload: {
     text: string;
+    messageType?: ChatRoomMessage['messageType'];
     mediaURL?: string;
     mediaType?: 'image' | 'video';
     audioURL?: string;
     audioDurationSec?: number;
+    stickerId?: string;
+    stickerUrl?: string;
+    stickerPackId?: string;
     replyTo?: ChatRoomMessage['replyTo'];
   }
 ): Promise<string> {
@@ -295,6 +388,18 @@ export async function sendChatRoomMessage(
       ? 'deputy_moderator'
       : 'member';
 
+  const messageType: ChatRoomMessage['messageType'] =
+    payload.messageType ||
+    (payload.stickerUrl || payload.stickerId
+      ? 'sticker'
+      : payload.audioURL
+      ? 'audio'
+      : payload.mediaURL
+      ? payload.mediaType === 'video'
+        ? 'video'
+        : 'image'
+      : 'text');
+
   try {
     const msg: ChatRoomMessage = cleanObj({
       id: msgId,
@@ -307,11 +412,15 @@ export async function sendChatRoomMessage(
       senderRoomRole,
       senderCustomTitle: sender.customTitle || null,
       senderCustomTitles: sender.customTitles || (sender.customTitle ? [sender.customTitle] : []),
+      messageType,
       text: payload.text.trim(),
       mediaURL: payload.mediaURL || '',
       mediaType: payload.mediaType,
       audioURL: payload.audioURL || '',
       audioDurationSec: payload.audioDurationSec,
+      stickerId: payload.stickerId,
+      stickerUrl: payload.stickerUrl,
+      stickerPackId: payload.stickerPackId,
       replyTo: payload.replyTo,
       reactions: {},
       createdAt: now,
@@ -320,10 +429,19 @@ export async function sendChatRoomMessage(
     await setDoc(doc(db, 'chatRooms', room.id, 'messages', msgId), msg);
     const preview =
       payload.text.trim() ||
-      (payload.mediaType === 'video' ? 'فيديو مرفق' : payload.mediaURL ? 'صورة مرفقة' : payload.audioURL ? 'رسالة صوتية' : '');
+      (messageType === 'sticker'
+        ? '✨ ملصق'
+        : payload.mediaType === 'video'
+        ? 'فيديو مرفق'
+        : payload.mediaURL
+        ? 'صورة مرفقة'
+        : payload.audioURL
+        ? 'رسالة صوتية'
+        : '');
 
     await updateDoc(doc(db, 'chatRooms', room.id), {
       lastMessageText: preview.slice(0, 120),
+      lastMessageSenderId: sender.id,
       lastMessageSenderName: sender.displayName,
       lastMessageAt: now,
       updatedAt: now,

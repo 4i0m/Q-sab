@@ -84,7 +84,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             photoURL: fbUser.photoURL,
           });
           setCurrentUser(profile);
-          await sendPresenceHeartbeat(profile.id, profile.displayName, profile.photoURL, true);
+          void sendPresenceHeartbeat(profile.id, profile.displayName, profile.photoURL, true);
 
           if ((profile.role === 'owner' || profile.role === 'admin') && !cleanupRanRef.current) {
             cleanupRanRef.current = true;

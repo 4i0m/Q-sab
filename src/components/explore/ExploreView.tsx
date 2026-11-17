@@ -25,8 +25,7 @@ import {
   Post,
   ChatRoom,
   PlatformAnnouncement,
-  PlatformAd,
-  getSortedUserTitles
+  PlatformAd
 } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
@@ -40,11 +39,13 @@ import {
 } from '../../services/firestore';
 import { listenToChatRooms } from '../../services/chatRooms';
 import { useToast } from '../../context/ToastContext';
-import { VerifiedBadge, CustomTitleBadge } from '../common/VerifiedBadge';
+import { VerifiedBadge } from '../common/VerifiedBadge';
 import { CommentsModal } from '../feed/CommentsModal';
 import { MediaImage } from '../common/MediaImage';
 import { formatRelativeTime } from '../../utils/date';
 import { stripMarkdownForPreview, estimateReadingMinutes } from '../common/RichBlogContent';
+import { useLiveUserProfiles } from '../../hooks/useUserProfiles';
+import { matchesSearchQuery } from '../../utils/search';
 
 type ExploreTab = 'all' | 'accounts' | 'rooms' | 'articles' | 'posts';
 
@@ -89,6 +90,9 @@ export function ExploreView({
   const [trendingTags, setTrendingTags] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedPostForComments, setSelectedPostForComments] = useState<Post | null>(null);
+
+  const livePostAuthors = useLiveUserProfiles(posts.map((p) => p.authorId));
+  const liveRoomOwners = useLiveUserProfiles(rooms.map((r) => r.ownerId));
 
   useEffect(() => {
     const fetchUsers = async () => {
@@ -189,41 +193,29 @@ export function ExploreView({
 
   const filteredUsers = useMemo(
     () =>
-      users.filter((u) => {
-        if (!qLower) return true;
-        return (
-          u.displayName.toLowerCase().includes(qLower) ||
-          u.handle.toLowerCase().includes(qLower) ||
-          Boolean(u.bio && u.bio.toLowerCase().includes(qLower))
-        );
-      }),
-    [users, qLower]
+      users.filter((u) =>
+        matchesSearchQuery(searchQuery, u.displayName, u.handle, u.bio)
+      ),
+    [users, searchQuery]
   );
 
   const filteredPosts = useMemo(
     () =>
       posts.filter((p) => {
-        if (!qLower) return true;
-        return (
-          p.content.toLowerCase().includes(qLower) ||
-          Boolean(p.title && p.title.toLowerCase().includes(qLower)) ||
-          p.authorName.toLowerCase().includes(qLower)
-        );
+        const liveName = livePostAuthors[p.authorId]?.displayName || p.authorName;
+        const liveHandle = livePostAuthors[p.authorId]?.handle || p.authorHandle;
+        return matchesSearchQuery(searchQuery, p.content, p.title, liveName, liveHandle);
       }),
-    [posts, qLower]
+    [posts, searchQuery, livePostAuthors]
   );
 
   const filteredRooms = useMemo(
     () =>
       rooms.filter((r) => {
-        if (!qLower) return true;
-        return (
-          r.title.toLowerCase().includes(qLower) ||
-          (r.description || '').toLowerCase().includes(qLower) ||
-          (r.topic || '').toLowerCase().includes(qLower)
-        );
+        const ownerName = liveRoomOwners[r.ownerId]?.displayName || r.ownerName;
+        return matchesSearchQuery(searchQuery, r.title, r.description, r.topic, ownerName);
       }),
-    [rooms, qLower]
+    [rooms, searchQuery, liveRoomOwners]
   );
 
   const featuredArticles = useMemo(
@@ -540,23 +532,12 @@ export function ExploreView({
                           {user.displayName}
                         </span>
                         {user.isVerified && (
-                          <VerifiedBadge category={user.verificationCategory || 'blue'} className="w-3 h-3 shrink-0" />
+                          <VerifiedBadge category={user.verificationCategory || 'blue'} className="w-3 h-3 shrink-0" interactive={false} />
                         )}
                       </div>
                       <span className="font-handle text-[11px] text-slate-500 dark:text-[#8E9BAB] truncate max-w-full mb-1">
                         @{user.handle}
                       </span>
-                      {(() => {
-                        const titles = getSortedUserTitles(user);
-                        if (titles.length === 0) return null;
-                        return (
-                          <div className="mb-1.5 flex flex-wrap items-center justify-center gap-1">
-                            {titles.slice(0, 2).map((tItem, idx) => (
-                              <CustomTitleBadge key={tItem.id || `${tItem.text}_${idx}`} title={tItem} compact />
-                            ))}
-                          </div>
-                        );
-                      })()}
                       <p className="text-[10px] text-slate-500 dark:text-[#94A3B8] line-clamp-1 min-h-[15px] mb-2.5">
                         {user.bio || 'عضو في Q'}
                       </p>
@@ -702,7 +683,7 @@ export function ExploreView({
                       {stripMarkdownForPreview(article.content)}
                     </p>
                     <p className="text-[10px] text-slate-400 truncate pt-0.5">
-                      بقلم {article.authorName} · {formatRelativeTime(article.createdAt)}
+                      بقلم {livePostAuthors[article.authorId]?.displayName || article.authorName} · {formatRelativeTime(article.createdAt)}
                     </p>
                   </div>
                 </button>
@@ -791,7 +772,7 @@ export function ExploreView({
                           }}
                           className="font-bold text-slate-900 dark:text-white hover:text-[#3B6DFF] truncate max-w-[105px] cursor-pointer text-start"
                         >
-                          {post.authorName}
+                          {livePostAuthors[post.authorId]?.displayName || post.authorName}
                         </button>
                         <span className="tabular-nums">{formatRelativeTime(post.createdAt)}</span>
                       </div>
@@ -848,23 +829,12 @@ export function ExploreView({
                         {user.displayName}
                       </span>
                       {user.isVerified && (
-                        <VerifiedBadge category={user.verificationCategory || 'blue'} className="w-3.5 h-3.5 shrink-0" />
+                        <VerifiedBadge category={user.verificationCategory || 'blue'} className="w-3.5 h-3.5 shrink-0" interactive={false} />
                       )}
                     </div>
                     <span className="font-handle text-[11px] text-slate-500 block truncate">
                       @{user.handle}
                     </span>
-                    {(() => {
-                      const titles = getSortedUserTitles(user);
-                      if (titles.length === 0) return null;
-                      return (
-                        <div className="flex flex-wrap items-center gap-1 mt-1">
-                          {titles.slice(0, 2).map((tItem, idx) => (
-                            <CustomTitleBadge key={tItem.id || `${tItem.text}_${idx}`} title={tItem} compact />
-                          ))}
-                        </div>
-                      );
-                    })()}
                   </div>
                 </button>
 

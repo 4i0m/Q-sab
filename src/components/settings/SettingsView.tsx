@@ -99,6 +99,9 @@ export function SettingsView({
   const [notifComments, setNotifComments] = useState(() => localStorage.getItem('q_notif_comments') !== 'false');
   const [notifFollows, setNotifFollows] = useState(() => localStorage.getItem('q_notif_follows') !== 'false');
   const [notifMessages, setNotifMessages] = useState(() => localStorage.getItem('q_notif_messages') !== 'false');
+  const [notifMessagePreview, setNotifMessagePreview] = useState(
+    () => localStorage.getItem('q_notif_showMessagePreview') !== 'false'
+  );
   const [notifAnnouncements, setNotifAnnouncements] = useState(
     () => localStorage.getItem('q_notif_announcements') !== 'false'
   );
@@ -129,6 +132,7 @@ export function SettingsView({
       setNotifComments(storedNotifs.comments ?? true);
       setNotifFollows(storedNotifs.follows ?? true);
       setNotifMessages(storedNotifs.messages ?? true);
+      setNotifMessagePreview(storedNotifs.showMessagePreview ?? true);
       setNotifAnnouncements(storedNotifs.announcements ?? true);
       setNotifSound(storedNotifs.sound ?? true);
     }
@@ -212,7 +216,7 @@ export function SettingsView({
   };
 
   const handleToggleNotification = async (
-    type: 'likes' | 'comments' | 'follows' | 'messages' | 'announcements' | 'sound',
+    type: 'likes' | 'comments' | 'follows' | 'messages' | 'showMessagePreview' | 'announcements' | 'sound',
     value: boolean,
     setter: (val: boolean) => void
   ) => {
@@ -224,6 +228,7 @@ export function SettingsView({
       comments: type === 'comments' ? value : notifComments,
       follows: type === 'follows' ? value : notifFollows,
       messages: type === 'messages' ? value : notifMessages,
+      showMessagePreview: type === 'showMessagePreview' ? value : notifMessagePreview,
       announcements: type === 'announcements' ? value : notifAnnouncements,
       sound: type === 'sound' ? value : notifSound,
     };
@@ -560,6 +565,7 @@ export function SettingsView({
               { key: 'comments' as const, val: notifComments, setter: setNotifComments, title: 'التعليقات والردود', desc: 'إشعار عند إضافة تعليق أو رد' },
               { key: 'follows' as const, val: notifFollows, setter: setNotifFollows, title: 'المتابعات الجديدة', desc: 'تنبيه فوري عند قيام عضو بمتابعتك' },
               { key: 'messages' as const, val: notifMessages, setter: setNotifMessages, title: 'الرسائل الخاصة', desc: 'تنبيه عند استلام رسالة مباشرة جديدة' },
+              { key: 'showMessagePreview' as const, val: notifMessagePreview, setter: setNotifMessagePreview, title: 'معاينة محتوى الرسالة في التنبيهات', desc: 'إظهار نص الرسالة في إشعارات الرسائل الخاصة (إيقافه يخفي النص للخصوصية)' },
               { key: 'announcements' as const, val: notifAnnouncements, setter: setNotifAnnouncements, title: 'فعاليات وإعلانات Q', desc: 'تنبيهات المسابقات والتحديات والبيانات الرسمية' },
               { key: 'sound' as const, val: notifSound, setter: setNotifSound, title: 'صوت التنبيهات الحية', desc: 'تشغيل نغمة صوتية خفيفة عند وصول إشعار أو بيان رسمي' },
             ].map((item, idx) => (

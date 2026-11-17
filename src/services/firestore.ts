@@ -1370,22 +1370,6 @@ export async function createGroupConversation(
 
     await setDoc(doc(db, 'conversations', convId), newConv);
 
-    await Promise.allSettled(
-      uniqueUsers
-        .filter((u) => u.id !== creator.id)
-        .map((u) =>
-          createNotification({
-            recipientId: u.id,
-            senderId: creator.id,
-            senderName: creator.displayName,
-            senderPhotoURL: creator.photoURL,
-            type: 'message',
-            targetId: convId,
-            message: `أضافك إلى دردشة جماعية: ${payload.groupName.trim()}`.slice(0, 80),
-          })
-        )
-    );
-
     return convId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
@@ -1421,20 +1405,6 @@ export async function addGroupConversationMembers(
       participantDetails: nextDetails,
       updatedAt: now,
     });
-
-    await Promise.allSettled(
-      added.map((u) =>
-        createNotification({
-          recipientId: u.id,
-          senderId: actor.id,
-          senderName: actor.displayName,
-          senderPhotoURL: actor.photoURL,
-          type: 'message',
-          targetId: conversation.id,
-          message: `أضافك إلى "${conversation.groupName || 'دردشة جماعية'}"`.slice(0, 80),
-        })
-      )
-    );
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
@@ -1499,6 +1469,7 @@ export async function sendMessage(
     audioDurationSec?: number;
     stickerId?: string;
     stickerUrl?: string;
+    stickerPackId?: string;
     replyTo?: Message['replyTo'];
     recipientIds?: string[];
   }
@@ -1511,7 +1482,7 @@ export async function sendMessage(
       extra?.messageType ||
       (extra?.audioURL
         ? 'audio'
-        : extra?.stickerId
+        : extra?.stickerId || extra?.stickerUrl
         ? 'sticker'
         : mediaURL
         ? extra?.mediaType === 'video'
@@ -1535,6 +1506,7 @@ export async function sendMessage(
       audioDurationSec: extra?.audioDurationSec,
       stickerId: extra?.stickerId,
       stickerUrl: extra?.stickerUrl,
+      stickerPackId: extra?.stickerPackId,
       replyTo: extra?.replyTo,
       reactions: {},
       createdAt: now,
@@ -1561,31 +1533,6 @@ export async function sendMessage(
       [`readBy.${sender.id}`]: now,
       [`typingUsers.${sender.id}`]: '',
     });
-
-    const targets = Array.from(
-      new Set(
-        (extra?.recipientIds && extra.recipientIds.length > 0
-          ? extra.recipientIds
-          : recipientId
-          ? [recipientId]
-          : []
-        ).filter((id) => id && id !== sender.id)
-      )
-    );
-
-    await Promise.allSettled(
-      targets.map((rid) =>
-        createNotification({
-          recipientId: rid,
-          senderId: sender.id,
-          senderName: sender.displayName,
-          senderPhotoURL: sender.photoURL,
-          type: 'message',
-          targetId: conversationId,
-          message: summaryText.slice(0, 50),
-        })
-      )
-    );
 
     return msgId;
   } catch (error) {
@@ -2433,10 +2380,11 @@ export async function recordAuditLog(log: Omit<AuditLog, 'id' | 'createdAt'>): P
 }
 
 export function listenToAuditLogs(
-  callback: (logs: AuditLog[]) => void
+  callback: (logs: AuditLog[]) => void,
+  limitCount = 200
 ): Unsubscribe {
   const path = 'audit_logs';
-  const q = query(collection(db, 'audit_logs'), orderBy('createdAt', 'desc'), limit(50));
+  const q = query(collection(db, 'audit_logs'), orderBy('createdAt', 'desc'), limit(limitCount));
   return onSnapshot(
     q,
     (snapshot) => {
@@ -2732,14 +2680,33 @@ export async function pinPostToProfile(
    REAL PLATFORM STATS (NO FAKE DATA)
    ========================================================================= */
 
-export async function getPlatformOverviewStats(): Promise<{
+export interface PlatformOverviewStats {
   totalUsers: number;
   totalPosts: number;
+  totalRooms: number;
+  totalEvents: number;
   pendingReports: number;
   pendingVerifications: number;
   pendingAppeals: number;
-}> {
+  pendingStickers: number;
+  activeLive: number;
+  fetchedAt?: string;
+}
+
+export async function getPlatformOverviewStats(): Promise<PlatformOverviewStats> {
   try {
+    const fbUser = auth.currentUser;
+    if (fbUser) {
+      const token = await fbUser.getIdToken();
+      const res = await fetch('/api/admin/metrics', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      if (res.ok) {
+        return (await res.json()) as PlatformOverviewStats;
+      }
+    }
     const [usersSnap, postsSnap, reportsSnap, vreqsSnap, appealsSnap] = await Promise.all([
       getDocs(query(collection(db, 'users'), limit(200))),
       getDocs(query(collection(db, 'posts'), limit(200))),
@@ -2751,29 +2718,100 @@ export async function getPlatformOverviewStats(): Promise<{
     return {
       totalUsers: usersSnap.size,
       totalPosts: postsSnap.size,
+      totalRooms: 0,
+      totalEvents: 0,
       pendingReports: reportsSnap.size,
       pendingVerifications: vreqsSnap.size,
       pendingAppeals: appealsSnap.size,
+      pendingStickers: 0,
+      activeLive: 0,
     };
   } catch (error) {
     console.error('Failed to get platform stats:', error);
     return {
       totalUsers: 0,
       totalPosts: 0,
+      totalRooms: 0,
+      totalEvents: 0,
       pendingReports: 0,
       pendingVerifications: 0,
       pendingAppeals: 0,
+      pendingStickers: 0,
+      activeLive: 0,
     };
   }
+}
+
+export async function adminRoomAction(payload: {
+  roomId: string;
+  action: 'toggle_readonly' | 'delete_room';
+  reason?: string;
+}): Promise<{ ok: boolean; isReadOnly?: boolean }> {
+  const fbUser = auth.currentUser;
+  if (!fbUser) throw new Error('يجب تسجيل الدخول.');
+  const token = await fbUser.getIdToken();
+  const res = await fetch('/api/admin/rooms-action', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error || 'تعذر تنفيذ إجراء الإدارة على الغرفة.');
+  }
+  return data;
 }
 
 /* =========================================================================
    XP ENGINE, LEVELING, CUSTOM TITLES & PROFILE GOVERNANCE
    ========================================================================= */
 
+export interface XpAwardResult {
+  awarded: boolean;
+  reason?: string;
+  xpDelta?: number;
+  xp?: number;
+  level?: number;
+  checkedInToday?: boolean;
+  nextResetAt?: string;
+  dailyXpEarned?: number;
+  dailyXpCap?: number;
+}
+
+export interface XpStatusResponse {
+  serverTime: string;
+  utcDate: string;
+  checkedInToday: boolean;
+  nextResetAt: string;
+  dailyXpEarned: number;
+  dailyXpCap: number;
+  xp: number;
+  level: number;
+}
+
+export async function fetchXpStatus(): Promise<XpStatusResponse | null> {
+  try {
+    const fbUser = auth.currentUser;
+    if (!fbUser) return null;
+    const token = await fbUser.getIdToken();
+    const res = await fetch('/api/xp/status', {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as XpStatusResponse;
+  } catch {
+    return null;
+  }
+}
+
 export async function awardUserXp(
-  action: XpLogEntry['action']
-): Promise<{ awarded: boolean; xpDelta?: number; xp?: number; level?: number } | null> {
+  action: Exclude<XpLogEntry['action'], 'admin_adjust'>
+): Promise<XpAwardResult | null> {
   try {
     const fbUser = auth.currentUser;
     if (!fbUser) return null;
@@ -2787,10 +2825,33 @@ export async function awardUserXp(
       body: JSON.stringify({ action }),
     });
     if (!res.ok) return null;
-    return await res.json();
+    return (await res.json()) as XpAwardResult;
   } catch {
     return null;
   }
+}
+
+export async function adminAdjustUserXp(
+  targetUserId: string,
+  delta: number,
+  reason: string
+): Promise<{ ok: boolean; xp: number; level: number }> {
+  const fbUser = auth.currentUser;
+  if (!fbUser) throw new Error('يجب تسجيل الدخول.');
+  const token = await fbUser.getIdToken();
+  const res = await fetch('/api/admin/xp-adjust', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ targetUserId, delta, reason }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error || 'تعذر تعديل نقاط الخبرة.');
+  }
+  return data;
 }
 
 export function listenToUserXpLogs(

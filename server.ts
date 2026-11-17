@@ -10,7 +10,7 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-type UploadFolder = 'avatars' | 'banners' | 'posts' | 'stories' | 'chats' | 'audio' | 'groups' | 'events' | 'rooms';
+type UploadFolder = 'avatars' | 'banners' | 'posts' | 'stories' | 'chats' | 'audio' | 'groups' | 'events' | 'rooms' | 'stickers' | 'live';
 
 interface FirebaseConfigFile {
   projectId?: string;
@@ -26,6 +26,8 @@ const VALID_FOLDERS: ReadonlySet<UploadFolder> = new Set([
   'groups',
   'events',
   'rooms',
+  'stickers',
+  'live',
 ]);
 
 const ALLOWED_IMAGE_MIME: ReadonlySet<string> = new Set([
@@ -437,7 +439,7 @@ function validateUploadRequest(folderRaw: string, contentTypeRaw: string, fileSi
 
   let maxBytes = MAX_IMAGE_BYTES;
   if (isImage && allowImages) {
-    maxBytes = MAX_IMAGE_BYTES;
+    maxBytes = folder === 'stickers' ? 2 * 1024 * 1024 : MAX_IMAGE_BYTES;
   } else if (isVideo && allowVideos) {
     maxBytes = MAX_VIDEO_BYTES;
   } else if (isAudio && allowAudio) {
@@ -958,7 +960,10 @@ async function startServer() {
     });
     if (!r.ok) {
       const txt = await r.text();
-      throw new Error(`Firestore CREATE ${collectionPath}/${docId} failed (${r.status}): ${txt}`);
+      const err = new Error(`Firestore CREATE ${collectionPath}/${docId} failed (${r.status}): ${txt}`) as Error & { status?: number; body?: string };
+      err.status = r.status;
+      err.body = txt;
+      throw err;
     }
     return await r.json();
   }
@@ -974,6 +979,8 @@ async function startServer() {
     }
   }
 
+  const DAILY_XP_CAP = 250;
+
   const XP_ACTION_CONFIG: Record<string, { amount: number; cooldownSec: number; label: string }> = {
     post_create: { amount: 20, cooldownSec: 20, label: 'نشر منشور جديد' },
     comment_create: { amount: 8, cooldownSec: 10, label: 'إضافة تعليق' },
@@ -981,8 +988,28 @@ async function startServer() {
     like_given: { amount: 3, cooldownSec: 4, label: 'تفاعل بإعجاب' },
     event_join: { amount: 12, cooldownSec: 30, label: 'المشاركة في فعالية' },
     room_message: { amount: 4, cooldownSec: 10, label: 'مشاركة في غرفة دردشة' },
+    live_watch: { amount: 6, cooldownSec: 180, label: 'متابعة بث مباشر' },
+    live_host: { amount: 15, cooldownSec: 300, label: 'تقديم بث مباشر' },
     daily_checkin: { amount: 15, cooldownSec: 20 * 3600, label: 'تسجيل الحضور اليومي' },
   };
+
+  function getUtcDateInfo(now = new Date()) {
+    const year = now.getUTCFullYear();
+    const month = now.getUTCMonth() + 1;
+    const day = now.getUTCDate();
+    const dateKey = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const docSuffix = `${year}_${month}_${day}`;
+    const nextResetAt = new Date(Date.UTC(year, now.getUTCMonth(), day + 1, 0, 0, 0, 0)).toISOString();
+    return {
+      year,
+      month,
+      day,
+      dateKey,
+      docSuffix,
+      nowIso: now.toISOString(),
+      nextResetAt,
+    };
+  }
 
   function computeServerLevelFromXp(xp: number): number {
     const safe = Math.max(0, Math.floor(xp));
@@ -993,8 +1020,48 @@ async function startServer() {
     return lv;
   }
 
-  const xpRecentMap = new Map<string, number>();
-  const xpDailyTotals = new Map<string, { day: string; total: number }>();
+  app.get('/api/xp/status', async (req: Request, res: Response) => {
+    let authUser: { uid: string; email?: string };
+    try {
+      authUser = await verifyFirebaseAuthHeader(req.headers.authorization);
+    } catch {
+      res.status(401).json({ error: 'جلسة غير مصرح بها.' });
+      return;
+    }
+
+    const token = String(req.headers.authorization || '').slice(7).trim();
+    const utc = getUtcDateInfo();
+    const checkinId = `${authUser.uid}_${utc.docSuffix}`;
+
+    try {
+      const [userDoc, checkinDoc] = await Promise.all([
+        fsGetDoc(`users/${authUser.uid}`, token),
+        fsGetDoc(`dailyCheckins/${checkinId}`, token).catch(() => null),
+      ]);
+
+      if (!userDoc) {
+        res.status(404).json({ error: 'لم يتم العثور على الملف الشخصي.' });
+        return;
+      }
+
+      const dailyXpEarned =
+        userDoc.dailyXpDate === utc.dateKey ? Math.max(0, Number(userDoc.dailyXpEarned || 0)) : 0;
+      const checkedInToday = Boolean(checkinDoc || userDoc.lastDailyCheckinDate === utc.dateKey);
+
+      res.status(200).json({
+        serverTime: utc.nowIso,
+        utcDate: utc.dateKey,
+        checkedInToday,
+        nextResetAt: utc.nextResetAt,
+        dailyXpEarned,
+        dailyXpCap: DAILY_XP_CAP,
+        xp: Math.max(0, Number(userDoc.xp || 0)),
+        level: Math.max(1, Number(userDoc.level || 1)),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'تعذر جلب حالة الخبرة اليومية.' });
+    }
+  });
 
   app.post('/api/xp/award', express.json({ limit: '16kb' }), async (req: Request, res: Response) => {
     let authUser: { uid: string; email?: string };
@@ -1013,21 +1080,10 @@ async function startServer() {
       return;
     }
 
-    const nowMs = Date.now();
-    const cooldownKey = `${authUser.uid}:${action}`;
-    const lastMs = xpRecentMap.get(cooldownKey) || 0;
-    if (nowMs - lastMs < cfg.cooldownSec * 1000) {
-      res.status(200).json({ awarded: false, reason: 'cooldown' });
-      return;
-    }
-
-    const dayStr = new Date().toISOString().slice(0, 10);
-    const daily = xpDailyTotals.get(authUser.uid);
-    const currentDayTotal = daily && daily.day === dayStr ? daily.total : 0;
-    if (currentDayTotal + cfg.amount > 300) {
-      res.status(200).json({ awarded: false, reason: 'daily_cap' });
-      return;
-    }
+    const now = new Date();
+    const nowMs = now.getTime();
+    const utc = getUtcDateInfo(now);
+    const checkinId = `${authUser.uid}_${utc.docSuffix}`;
 
     try {
       const userDoc = await fsGetDoc(`users/${authUser.uid}`, token);
@@ -1036,20 +1092,108 @@ async function startServer() {
         return;
       }
 
-      const prevXp = Number(userDoc.xp || 0);
-      const nextXp = prevXp + cfg.amount;
-      const prevLevel = Math.max(1, Number(userDoc.level || 1));
-      const nextLevel = Math.max(prevLevel, computeServerLevelFromXp(nextXp));
+      const currentDayTotal =
+        userDoc.dailyXpDate === utc.dateKey ? Math.max(0, Math.floor(Number(userDoc.dailyXpEarned || 0))) : 0;
 
-      await fsPatchDoc(
-        `users/${authUser.uid}`,
-        {
-          xp: nextXp,
-          level: Math.min(nextLevel, prevLevel + 1),
-          lastActiveAt: new Date().toISOString(),
-        },
-        token
-      );
+      if (action === 'daily_checkin') {
+        if (userDoc.lastDailyCheckinDate === utc.dateKey) {
+          res.status(200).json({
+            awarded: false,
+            reason: 'already_claimed',
+            checkedInToday: true,
+            nextResetAt: utc.nextResetAt,
+            dailyXpEarned: currentDayTotal,
+            dailyXpCap: DAILY_XP_CAP,
+          });
+          return;
+        }
+        try {
+          await fsCreateDoc(
+            'dailyCheckins',
+            checkinId,
+            {
+              id: checkinId,
+              userId: authUser.uid,
+              dateKey: utc.dateKey,
+              amount: cfg.amount,
+              createdAt: utc.nowIso,
+            },
+            token
+          );
+        } catch (checkinErr: any) {
+          if (checkinErr?.status === 409 || String(checkinErr?.message || '').includes('ALREADY_EXISTS')) {
+            res.status(200).json({
+              awarded: false,
+              reason: 'already_claimed',
+              checkedInToday: true,
+              nextResetAt: utc.nextResetAt,
+              dailyXpEarned: currentDayTotal,
+              dailyXpCap: DAILY_XP_CAP,
+            });
+            return;
+          }
+          throw checkinErr;
+        }
+      } else {
+        const lastActionMap =
+          userDoc.xpActionLastAt && typeof userDoc.xpActionLastAt === 'object'
+            ? (userDoc.xpActionLastAt as Record<string, unknown>)
+            : {};
+        const lastIso = typeof lastActionMap[action] === 'string' ? (lastActionMap[action] as string) : '';
+        const lastMs = lastIso ? new Date(lastIso).getTime() : 0;
+        if (lastMs && nowMs - lastMs < cfg.cooldownSec * 1000) {
+          res.status(200).json({
+            awarded: false,
+            reason: 'cooldown',
+            dailyXpEarned: currentDayTotal,
+            dailyXpCap: DAILY_XP_CAP,
+          });
+          return;
+        }
+
+        if (currentDayTotal + cfg.amount > DAILY_XP_CAP) {
+          res.status(200).json({
+            awarded: false,
+            reason: 'daily_cap',
+            dailyXpEarned: currentDayTotal,
+            dailyXpCap: DAILY_XP_CAP,
+          });
+          return;
+        }
+      }
+
+      const prevXp = Math.max(0, Math.floor(Number(userDoc.xp || 0)));
+      const nextXp = prevXp + cfg.amount;
+      const prevLevel = Math.max(1, Math.floor(Number(userDoc.level || 1)));
+      const computedLevel = Math.max(prevLevel, computeServerLevelFromXp(nextXp));
+      const boundedLevel = Math.min(computedLevel, prevLevel + 1);
+      const nextDailyTotal =
+        action === 'daily_checkin'
+          ? Math.min(DAILY_XP_CAP, currentDayTotal + cfg.amount)
+          : currentDayTotal + cfg.amount;
+
+      const nextActionMap: Record<string, string> = {};
+      if (userDoc.xpActionLastAt && typeof userDoc.xpActionLastAt === 'object') {
+        for (const [k, v] of Object.entries(userDoc.xpActionLastAt)) {
+          if (typeof v === 'string') nextActionMap[k] = v;
+        }
+      }
+      nextActionMap[action] = utc.nowIso;
+
+      const userPatch: Record<string, unknown> = {
+        xp: nextXp,
+        level: boundedLevel,
+        dailyXpDate: utc.dateKey,
+        dailyXpEarned: nextDailyTotal,
+        xpActionLastAt: nextActionMap,
+        lastActiveAt: utc.nowIso,
+      };
+      if (action === 'daily_checkin') {
+        userPatch.lastDailyCheckinDate = utc.dateKey;
+        userPatch.lastDailyCheckinAt = utc.nowIso;
+      }
+
+      await fsPatchDoc(`users/${authUser.uid}`, userPatch, token);
 
       const logId = `xp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
       await fsCreateDoc(
@@ -1061,22 +1205,128 @@ async function startServer() {
           action,
           amount: cfg.amount,
           label: cfg.label,
-          createdAt: new Date().toISOString(),
+          createdAt: utc.nowIso,
         },
         token
       ).catch(() => {});
-
-      xpRecentMap.set(cooldownKey, nowMs);
-      xpDailyTotals.set(authUser.uid, { day: dayStr, total: currentDayTotal + cfg.amount });
 
       res.status(200).json({
         awarded: true,
         xpDelta: cfg.amount,
         xp: nextXp,
-        level: Math.min(nextLevel, prevLevel + 1),
+        level: boundedLevel,
+        checkedInToday: action === 'daily_checkin' ? true : Boolean(userDoc.lastDailyCheckinDate === utc.dateKey),
+        nextResetAt: utc.nextResetAt,
+        dailyXpEarned: nextDailyTotal,
+        dailyXpCap: DAILY_XP_CAP,
       });
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'تعذر احتساب نقاط الخبرة.' });
+    }
+  });
+
+  app.post('/api/admin/xp-adjust', express.json({ limit: '24kb' }), async (req: Request, res: Response) => {
+    let authUser: { uid: string; email?: string };
+    try {
+      authUser = await verifyFirebaseAuthHeader(req.headers.authorization);
+    } catch {
+      res.status(401).json({ error: 'جلسة غير مصرح بها.' });
+      return;
+    }
+
+    const token = String(req.headers.authorization || '').slice(7).trim();
+    const { targetUserId, delta, reason = '' } = (req.body || {}) as {
+      targetUserId?: string;
+      delta?: number;
+      reason?: string;
+    };
+
+    const parsedDelta = Math.trunc(Number(delta));
+    if (!targetUserId || !Number.isFinite(parsedDelta) || parsedDelta === 0 || Math.abs(parsedDelta) > 5000) {
+      res.status(400).json({ error: 'قيمة تعديل XP غير صالحة (يجب أن تكون بين -5000 و +5000 ولا تساوي صفراً).' });
+      return;
+    }
+
+    try {
+      const [actorDoc, targetDoc] = await Promise.all([
+        fsGetDoc(`users/${authUser.uid}`, token),
+        fsGetDoc(`users/${targetUserId}`, token),
+      ]);
+
+      if (!actorDoc || !targetDoc) {
+        res.status(404).json({ error: 'تعذر العثور على الحساب المطلوب.' });
+        return;
+      }
+
+      const actorRole = String(actorDoc.role || 'user');
+      const targetRole = String(targetDoc.role || 'user');
+      const canAdjust =
+        actorRole === 'owner' ||
+        actorRole === 'admin' ||
+        hasActorGlobalPerm(actorDoc, 'manageUsers');
+
+      if (!canAdjust) {
+        res.status(403).json({ error: 'ليست لديك صلاحية تعديل نقاط الخبرة.' });
+        return;
+      }
+
+      if (targetRole === 'owner' && authUser.uid !== targetUserId) {
+        res.status(403).json({ error: 'لا يمكن تعديل نقاط حساب مؤسس المنصة.' });
+        return;
+      }
+
+      const prevXp = Math.max(0, Math.floor(Number(targetDoc.xp || 0)));
+      const nextXp = Math.max(0, prevXp + parsedDelta);
+      const nextLevel = Math.max(1, computeServerLevelFromXp(nextXp));
+      const nowIso = new Date().toISOString();
+
+      await fsPatchDoc(
+        `users/${targetUserId}`,
+        {
+          xp: nextXp,
+          level: nextLevel,
+        },
+        token
+      );
+
+      const cleanReason = String(reason || '').trim().slice(0, 200);
+      const logId = `xp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      await fsCreateDoc(
+        'xpLogs',
+        logId,
+        {
+          id: logId,
+          userId: targetUserId,
+          action: 'admin_adjust',
+          amount: parsedDelta,
+          label: cleanReason ? `تعديل إداري: ${cleanReason}` : 'تعديل إداري لنقاط الخبرة',
+          createdAt: nowIso,
+        },
+        token
+      ).catch(() => {});
+
+      const auditId = `log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      await fsCreateDoc(
+        'audit_logs',
+        auditId,
+        {
+          id: auditId,
+          actorId: authUser.uid,
+          actorName: String(actorDoc.displayName || 'Admin'),
+          actorRole,
+          actionType: 'xp_adjust',
+          targetType: 'user',
+          targetId: targetUserId,
+          targetDetails: `Adjusted XP by ${parsedDelta > 0 ? `+${parsedDelta}` : parsedDelta} (${prevXp} -> ${nextXp}, Lv ${nextLevel})`,
+          reason: cleanReason,
+          createdAt: nowIso,
+        },
+        token
+      ).catch(() => {});
+
+      res.status(200).json({ ok: true, xp: nextXp, level: nextLevel });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'تعذر تعديل نقاط الخبرة.' });
     }
   });
 
@@ -1090,6 +1340,8 @@ async function startServer() {
     'manageVerifications',
     'manageRooms',
     'manageWiki',
+    'manageStickers',
+    'manageLive',
     'viewAuditLogs',
   ] as const;
 
@@ -1863,7 +2115,18 @@ async function startServer() {
       imageURL?: string;
       reason?: string;
       permissions?: Record<string, boolean>;
-      appearance?: { bgColor?: string; bgImageURL?: string; accentColor?: string; bubbleTheme?: string; imageURL?: string; coverURL?: string; title?: string; description?: string };
+      appearance?: {
+        bgColor?: string;
+        bgPresetId?: string;
+        bgImageURL?: string;
+        bgScrimOpacity?: number;
+        accentColor?: string;
+        bubbleTheme?: string;
+        imageURL?: string;
+        coverURL?: string;
+        title?: string;
+        description?: string;
+      };
     };
 
     if (!roomId || !action) {
@@ -2163,8 +2426,12 @@ async function startServer() {
         if (appearance?.imageURL !== undefined) roomPatch.imageURL = String(appearance.imageURL);
         if (appearance?.coverURL !== undefined) roomPatch.coverURL = String(appearance.coverURL);
         roomPatch.appearance = {
-          bgColor: String(appearance?.bgColor || roomDoc.appearance?.bgColor || ''),
-          bgImageURL: String(appearance?.bgImageURL || roomDoc.appearance?.bgImageURL || ''),
+          bgColor: String(appearance?.bgColor ?? roomDoc.appearance?.bgColor ?? ''),
+          bgPresetId: String(appearance?.bgPresetId ?? roomDoc.appearance?.bgPresetId ?? 'default'),
+          bgImageURL: String(appearance?.bgImageURL ?? roomDoc.appearance?.bgImageURL ?? ''),
+          bgScrimOpacity: Number.isFinite(Number(appearance?.bgScrimOpacity))
+            ? Math.min(0.9, Math.max(0.1, Number(appearance?.bgScrimOpacity)))
+            : Number(roomDoc.appearance?.bgScrimOpacity ?? 0.45),
           accentColor: String(appearance?.accentColor || roomDoc.appearance?.accentColor || '#3B6DFF'),
           bubbleTheme: String(appearance?.bubbleTheme || roomDoc.appearance?.bubbleTheme || 'classic'),
         };
@@ -2196,6 +2463,622 @@ async function startServer() {
       res.status(200).json({ ok: true, action: logSummary });
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'فشل تنفيذ إجراء الغرفة.' });
+    }
+  });
+
+  async function fsCountCollection(
+    collectionId: string,
+    bearerToken: string,
+    filter?: { field: string; value: string }
+  ): Promise<number> {
+    const structuredQuery: Record<string, unknown> = {
+      from: [{ collectionId }],
+    };
+    if (filter) {
+      structuredQuery.where = {
+        fieldFilter: {
+          field: { fieldPath: filter.field },
+          op: 'EQUAL',
+          value: { stringValue: filter.value },
+        },
+      };
+    }
+    const r = await fetch(`${FIRESTORE_REST_BASE}:runAggregationQuery`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${bearerToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        structuredAggregationQuery: {
+          structuredQuery,
+          aggregations: [{ alias: 'total', count: {} }],
+        },
+      }),
+    });
+    if (!r.ok) return 0;
+    const rows = (await r.json()) as Array<{
+      result?: { aggregateFields?: { total?: { integerValue?: string | number } } };
+    }>;
+    const rawVal = rows?.[0]?.result?.aggregateFields?.total?.integerValue;
+    return Number.isFinite(Number(rawVal)) ? Number(rawVal) : 0;
+  }
+
+  app.get('/api/admin/metrics', async (req: Request, res: Response) => {
+    let authUser: { uid: string; email?: string };
+    try {
+      authUser = await verifyFirebaseAuthHeader(req.headers.authorization);
+    } catch {
+      res.status(401).json({ error: 'جلسة غير مصرح بها.' });
+      return;
+    }
+    const token = String(req.headers.authorization || '').slice(7).trim();
+    try {
+      const actorDoc = await fsGetDoc(`users/${authUser.uid}`, token);
+      if (!actorDoc) {
+        res.status(404).json({ error: 'الحساب غير موجود.' });
+        return;
+      }
+      const actorRole = String(actorDoc.role || 'user');
+      const perms = actorDoc.globalPermissions && typeof actorDoc.globalPermissions === 'object' ? actorDoc.globalPermissions : {};
+      const isStaffActor =
+        ['owner', 'admin', 'assistant_admin', 'room_leader', 'moderator'].includes(actorRole) ||
+        Object.values(perms).some(Boolean);
+      if (!isStaffActor) {
+        res.status(403).json({ error: 'صلاحية مرفوضة.' });
+        return;
+      }
+
+      const [
+        totalUsers,
+        totalPosts,
+        totalRooms,
+        totalEvents,
+        pendingReports,
+        pendingVerifications,
+        pendingAppeals,
+        pendingStickers,
+        activeLive,
+      ] = await Promise.all([
+        fsCountCollection('users', token),
+        fsCountCollection('posts', token),
+        fsCountCollection('chatRooms', token),
+        fsCountCollection('events', token),
+        fsCountCollection('reports', token, { field: 'status', value: 'pending' }),
+        fsCountCollection('verification_requests', token, { field: 'status', value: 'pending' }),
+        fsCountCollection('appeals', token, { field: 'status', value: 'pending' }),
+        fsCountCollection('stickerPacks', token, { field: 'status', value: 'pending' }),
+        fsCountCollection('liveBroadcasts', token, { field: 'status', value: 'live' }),
+      ]);
+
+      res.status(200).json({
+        totalUsers,
+        totalPosts,
+        totalRooms,
+        totalEvents,
+        pendingReports,
+        pendingVerifications,
+        pendingAppeals,
+        pendingStickers,
+        activeLive,
+        fetchedAt: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'تعذر جلب إحصائيات المنصة.' });
+    }
+  });
+
+  app.post('/api/stickers/packs', express.json({ limit: '64kb' }), async (req: Request, res: Response) => {
+    let authUser: { uid: string; email?: string };
+    try {
+      authUser = await verifyFirebaseAuthHeader(req.headers.authorization);
+    } catch {
+      res.status(401).json({ error: 'يجب تسجيل الدخول لرفع حزمة ملصقات.' });
+      return;
+    }
+    const token = String(req.headers.authorization || '').slice(7).trim();
+    const { title, description = '', coverURL, stickers } = (req.body || {}) as {
+      title?: string;
+      description?: string;
+      coverURL?: string;
+      stickers?: Array<{ id?: string; url?: string; label?: string; storagePath?: string; contentType?: string; sizeBytes?: number }>;
+    };
+
+    const cleanTitle = String(title || '').trim().slice(0, 60);
+    if (cleanTitle.length < 2) {
+      res.status(400).json({ error: 'يجب أن يكون اسم حزمة الملصقات مكوناً من حرفين على الأقل.' });
+      return;
+    }
+    if (!Array.isArray(stickers) || stickers.length < 1 || stickers.length > 30) {
+      res.status(400).json({ error: 'يجب أن تحتوي الحزمة على ملصق واحد إلى 30 ملصقاً.' });
+      return;
+    }
+
+    const sanitizedStickers = stickers
+      .map((s, idx) => ({
+        id: String(s?.id || `stk_${Date.now()}_${idx}`).slice(0, 64),
+        url: String(s?.url || '').trim(),
+        label: String(s?.label || '').trim().slice(0, 40),
+        storagePath: String(s?.storagePath || '').trim().slice(0, 300),
+        contentType: String(s?.contentType || 'image/webp').slice(0, 50),
+        sizeBytes: Number.isFinite(Number(s?.sizeBytes)) ? Number(s?.sizeBytes) : 0,
+      }))
+      .filter((s) => /^https?:\/\//i.test(s.url));
+
+    if (sanitizedStickers.length === 0) {
+      res.status(400).json({ error: 'روابط صور الملصقات غير صالحة.' });
+      return;
+    }
+
+    try {
+      const actorDoc = await fsGetDoc(`users/${authUser.uid}`, token);
+      if (!actorDoc) {
+        res.status(404).json({ error: 'لم يتم العثور على الحساب.' });
+        return;
+      }
+      if (actorDoc.isBanned || actorDoc.isSuspended) {
+        res.status(403).json({ error: 'حسابك مقيد ولا يمكنه رفع حزم ملصقات.' });
+        return;
+      }
+
+      const actorRole = String(actorDoc.role || 'user');
+      const autoApprove =
+        actorRole === 'owner' ||
+        actorRole === 'admin' ||
+        actorRole === 'assistant_admin' ||
+        hasActorGlobalPerm(actorDoc, 'manageStickers');
+
+      const now = new Date().toISOString();
+      const packId = `spack_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      const packDoc = {
+        id: packId,
+        title: cleanTitle,
+        description: String(description || '').trim().slice(0, 240),
+        coverURL: /^https?:\/\//i.test(String(coverURL || '')) ? String(coverURL).trim() : sanitizedStickers[0].url,
+        authorId: authUser.uid,
+        authorName: String(actorDoc.displayName || 'Q Member'),
+        status: autoApprove ? 'approved' : 'pending',
+        isEnabled: autoApprove,
+        moderationNote: '',
+        stickers: sanitizedStickers,
+        installsCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await fsCreateDoc('stickerPacks', packId, packDoc, token);
+      res.status(200).json({ ok: true, pack: packDoc });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'تعذر حفظ حزمة الملصقات.' });
+    }
+  });
+
+  app.post('/api/admin/stickers', express.json({ limit: '32kb' }), async (req: Request, res: Response) => {
+    let authUser: { uid: string; email?: string };
+    try {
+      authUser = await verifyFirebaseAuthHeader(req.headers.authorization);
+    } catch {
+      res.status(401).json({ error: 'يجب تسجيل الدخول.' });
+      return;
+    }
+    const token = String(req.headers.authorization || '').slice(7).trim();
+    const { packId, action, note = '' } = (req.body || {}) as {
+      packId?: string;
+      action?: 'approve' | 'reject' | 'disable' | 'enable' | 'delete';
+      note?: string;
+    };
+
+    if (!packId || !action) {
+      res.status(400).json({ error: 'بيانات الإجراء ناقصة.' });
+      return;
+    }
+
+    try {
+      const [actorDoc, packDoc] = await Promise.all([
+        fsGetDoc(`users/${authUser.uid}`, token),
+        fsGetDoc(`stickerPacks/${packId}`, token),
+      ]);
+      if (!actorDoc || !packDoc) {
+        res.status(404).json({ error: 'الحزمة أو الحساب غير موجود.' });
+        return;
+      }
+      const actorRole = String(actorDoc.role || 'user');
+      const allowed =
+        actorRole === 'owner' ||
+        actorRole === 'admin' ||
+        actorRole === 'assistant_admin' ||
+        hasActorGlobalPerm(actorDoc, 'manageStickers');
+
+      if (!allowed) {
+        res.status(403).json({ error: 'ليست لديك صلاحية إدارة حزم الملصقات.' });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const cleanNote = String(note || '').trim().slice(0, 400);
+
+      if (action === 'delete') {
+        await fsDeleteDoc(`stickerPacks/${packId}`, token);
+      } else {
+        const nextStatus =
+          action === 'approve' || action === 'enable'
+            ? 'approved'
+            : action === 'reject'
+            ? 'rejected'
+            : 'disabled';
+        const nextEnabled = action === 'approve' || action === 'enable';
+        await fsPatchDoc(
+          `stickerPacks/${packId}`,
+          {
+            status: nextStatus,
+            isEnabled: nextEnabled,
+            moderationNote: cleanNote,
+            reviewedBy: authUser.uid,
+            reviewedByName: String(actorDoc.displayName || 'Admin'),
+            reviewedAt: now,
+            updatedAt: now,
+          },
+          token
+        );
+      }
+
+      const auditId = `log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      const auditActionMap: Record<string, string> = {
+        approve: 'sticker_approve',
+        reject: 'sticker_reject',
+        disable: 'sticker_disable',
+        enable: 'sticker_enable',
+        delete: 'sticker_delete',
+      };
+      await fsCreateDoc(
+        'audit_logs',
+        auditId,
+        {
+          id: auditId,
+          actorId: authUser.uid,
+          actorName: String(actorDoc.displayName || 'Admin'),
+          actorRole,
+          actionType: auditActionMap[action] || 'sticker_approve',
+          targetType: 'sticker_pack',
+          targetId: packId,
+          targetDetails: `Sticker pack "${packDoc.title || packId}" -> ${action}`,
+          reason: cleanNote,
+          createdAt: now,
+        },
+        token
+      ).catch(() => {});
+
+      if (packDoc.authorId && packDoc.authorId !== authUser.uid && (action === 'approve' || action === 'reject' || action === 'disable')) {
+        const nid = `notif_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+        const msg =
+          action === 'approve'
+            ? `تمت الموافقة على حزمة الملصقات "${packDoc.title}" وأصبحت متاحة في الدردشات.`
+            : action === 'reject'
+            ? `تم رفض حزمة الملصقات "${packDoc.title}". ${cleanNote ? `السبب: ${cleanNote}` : ''}`
+            : `تم تعطيل حزمة الملصقات "${packDoc.title}" إدارياً.`;
+        await fsCreateDoc(
+          'notifications',
+          nid,
+          {
+            id: nid,
+            recipientId: String(packDoc.authorId),
+            senderId: authUser.uid,
+            senderName: 'إدارة Q',
+            senderPhotoURL: String(actorDoc.photoURL || ''),
+            type: 'moderation',
+            targetId: packId,
+            message: msg.slice(0, 290),
+            read: false,
+            createdAt: now,
+          },
+          token
+        ).catch(() => {});
+      }
+
+      res.status(200).json({ ok: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'تعذر تنفيذ إجراء الملصقات.' });
+    }
+  });
+
+  app.post('/api/admin/rooms-action', express.json({ limit: '24kb' }), async (req: Request, res: Response) => {
+    let authUser: { uid: string; email?: string };
+    try {
+      authUser = await verifyFirebaseAuthHeader(req.headers.authorization);
+    } catch {
+      res.status(401).json({ error: 'جلسة غير مصرح بها.' });
+      return;
+    }
+    const token = String(req.headers.authorization || '').slice(7).trim();
+    const { roomId, action, reason = '' } = (req.body || {}) as {
+      roomId?: string;
+      action?: 'toggle_readonly' | 'delete_room';
+      reason?: string;
+    };
+    if (!roomId || !action) {
+      res.status(400).json({ error: 'بيانات الغرفة ناقصة.' });
+      return;
+    }
+    try {
+      const [actorDoc, roomDoc] = await Promise.all([
+        fsGetDoc(`users/${authUser.uid}`, token),
+        fsGetDoc(`chatRooms/${roomId}`, token),
+      ]);
+      if (!actorDoc || !roomDoc) {
+        res.status(404).json({ error: 'الغرفة أو الحساب غير موجود.' });
+        return;
+      }
+      const actorRole = String(actorDoc.role || 'user');
+      const allowed =
+        actorRole === 'owner' ||
+        actorRole === 'admin' ||
+        actorRole === 'assistant_admin' ||
+        hasActorGlobalPerm(actorDoc, 'manageRooms');
+      if (!allowed) {
+        res.status(403).json({ error: 'ليست لديك صلاحية الرقابة على غرف الدردشة.' });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      if (action === 'toggle_readonly') {
+        const nextRo = !Boolean(roomDoc.isReadOnly);
+        await fsPatchDoc(`chatRooms/${roomId}`, { isReadOnly: nextRo, updatedAt: now }, token);
+      } else if (action === 'delete_room') {
+        await fsDeleteDoc(`chatRooms/${roomId}`, token);
+      }
+
+      const auditId = `log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      await fsCreateDoc(
+        'audit_logs',
+        auditId,
+        {
+          id: auditId,
+          actorId: authUser.uid,
+          actorName: String(actorDoc.displayName || 'Admin'),
+          actorRole,
+          actionType: action === 'delete_room' ? 'room_delete' : 'room_kick',
+          targetType: 'room',
+          targetId: roomId,
+          targetDetails: `${action} on room "${roomDoc.title || roomId}"`,
+          reason: String(reason || '').slice(0, 300),
+          createdAt: now,
+        },
+        token
+      ).catch(() => {});
+
+      res.status(200).json({ ok: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'تعذر تنفيذ إجراء الغرفة.' });
+    }
+  });
+
+  app.post('/api/live/moderate', express.json({ limit: '24kb' }), async (req: Request, res: Response) => {
+    let authUser: { uid: string; email?: string };
+    try {
+      authUser = await verifyFirebaseAuthHeader(req.headers.authorization);
+    } catch {
+      res.status(401).json({ error: 'يجب تسجيل الدخول.' });
+      return;
+    }
+    const token = String(req.headers.authorization || '').slice(7).trim();
+    const { broadcastId, action, targetUserId, reason = '' } = (req.body || {}) as {
+      broadcastId?: string;
+      action?: 'end_broadcast' | 'toggle_chat' | 'mute_viewer' | 'unmute_viewer' | 'ban_viewer';
+      targetUserId?: string;
+      reason?: string;
+    };
+    if (!broadcastId || !action) {
+      res.status(400).json({ error: 'بيانات البث ناقصة.' });
+      return;
+    }
+    try {
+      const [actorDoc, liveDoc] = await Promise.all([
+        fsGetDoc(`users/${authUser.uid}`, token),
+        fsGetDoc(`liveBroadcasts/${broadcastId}`, token),
+      ]);
+      if (!actorDoc || !liveDoc) {
+        res.status(404).json({ error: 'البث أو الحساب غير موجود.' });
+        return;
+      }
+      const actorRole = String(actorDoc.role || 'user');
+      const isHost = liveDoc.hostId === authUser.uid;
+      const isStaffAllowed =
+        actorRole === 'owner' ||
+        actorRole === 'admin' ||
+        actorRole === 'assistant_admin' ||
+        hasActorGlobalPerm(actorDoc, 'manageLive');
+
+      if (!isHost && !isStaffAllowed) {
+        res.status(403).json({ error: 'ليست لديك صلاحية إدارة هذا البث.' });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const mutedList: string[] = Array.isArray(liveDoc.mutedUserIds) ? liveDoc.mutedUserIds : [];
+      const bannedList: string[] = Array.isArray(liveDoc.bannedUserIds) ? liveDoc.bannedUserIds : [];
+
+      if (action === 'end_broadcast') {
+        await fsPatchDoc(
+          `liveBroadcasts/${broadcastId}`,
+          {
+            status: 'ended',
+            playbackState: 'paused',
+            endedAt: now,
+            updatedAt: now,
+          },
+          token
+        );
+      } else if (action === 'toggle_chat') {
+        await fsPatchDoc(
+          `liveBroadcasts/${broadcastId}`,
+          { isChatEnabled: !Boolean(liveDoc.isChatEnabled), updatedAt: now },
+          token
+        );
+      } else if (targetUserId && targetUserId !== liveDoc.hostId) {
+        if (action === 'mute_viewer') {
+          await fsPatchDoc(
+            `liveBroadcasts/${broadcastId}`,
+            { mutedUserIds: Array.from(new Set([...mutedList, targetUserId])), updatedAt: now },
+            token
+          );
+        } else if (action === 'unmute_viewer') {
+          await fsPatchDoc(
+            `liveBroadcasts/${broadcastId}`,
+            { mutedUserIds: mutedList.filter((id) => id !== targetUserId), updatedAt: now },
+            token
+          );
+        } else if (action === 'ban_viewer') {
+          await fsPatchDoc(
+            `liveBroadcasts/${broadcastId}`,
+            { bannedUserIds: Array.from(new Set([...bannedList, targetUserId])), updatedAt: now },
+            token
+          );
+          await fsDeleteDoc(`liveBroadcasts/${broadcastId}/viewers/${targetUserId}`, token).catch(() => {});
+        }
+      }
+
+      if (isStaffAllowed && action === 'end_broadcast') {
+        const auditId = `log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+        await fsCreateDoc(
+          'audit_logs',
+          auditId,
+          {
+            id: auditId,
+            actorId: authUser.uid,
+            actorName: String(actorDoc.displayName || 'Admin'),
+            actorRole,
+            actionType: 'live_end',
+            targetType: 'live_broadcast',
+            targetId: broadcastId,
+            targetDetails: `Ended live broadcast "${liveDoc.title || broadcastId}"`,
+            reason: String(reason || '').slice(0, 300),
+            createdAt: now,
+          },
+          token
+        ).catch(() => {});
+      }
+
+      res.status(200).json({ ok: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'تعذر تنفيذ إجراء البث.' });
+    }
+  });
+
+  app.post('/api/live/xp', express.json({ limit: '16kb' }), async (req: Request, res: Response) => {
+    let authUser: { uid: string; email?: string };
+    try {
+      authUser = await verifyFirebaseAuthHeader(req.headers.authorization);
+    } catch {
+      res.status(401).json({ error: 'جلسة غير مصرح بها.' });
+      return;
+    }
+    const token = String(req.headers.authorization || '').slice(7).trim();
+    const { broadcastId, role } = (req.body || {}) as { broadcastId?: string; role?: 'watch' | 'host' };
+    if (!broadcastId || (role !== 'watch' && role !== 'host')) {
+      res.status(400).json({ error: 'بيانات البث غير صالحة.' });
+      return;
+    }
+
+    const action = role === 'host' ? 'live_host' : 'live_watch';
+    const cfg = XP_ACTION_CONFIG[action];
+    const now = new Date();
+    const nowMs = now.getTime();
+    const utc = getUtcDateInfo(now);
+
+    try {
+      const [userDoc, liveDoc] = await Promise.all([
+        fsGetDoc(`users/${authUser.uid}`, token),
+        fsGetDoc(`liveBroadcasts/${broadcastId}`, token),
+      ]);
+      if (!userDoc || !liveDoc) {
+        res.status(404).json({ error: 'البث أو الحساب غير موجود.' });
+        return;
+      }
+      if (liveDoc.status !== 'live') {
+        res.status(200).json({ awarded: false, reason: 'broadcast_ended' });
+        return;
+      }
+      if (role === 'host' && liveDoc.hostId !== authUser.uid) {
+        res.status(403).json({ error: 'أنت لست مقدم هذا البث.' });
+        return;
+      }
+      if (role === 'watch' && liveDoc.hostId === authUser.uid) {
+        res.status(200).json({ awarded: false, reason: 'self_watch_blocked' });
+        return;
+      }
+      if (Array.isArray(liveDoc.bannedUserIds) && liveDoc.bannedUserIds.includes(authUser.uid)) {
+        res.status(403).json({ error: 'تم استبعادك من هذا البث.' });
+        return;
+      }
+
+      const currentDayTotal =
+        userDoc.dailyXpDate === utc.dateKey ? Math.max(0, Math.floor(Number(userDoc.dailyXpEarned || 0))) : 0;
+      const lastActionMap =
+        userDoc.xpActionLastAt && typeof userDoc.xpActionLastAt === 'object'
+          ? (userDoc.xpActionLastAt as Record<string, unknown>)
+          : {};
+      const lastIso = typeof lastActionMap[action] === 'string' ? (lastActionMap[action] as string) : '';
+      const lastMs = lastIso ? new Date(lastIso).getTime() : 0;
+
+      if (lastMs && nowMs - lastMs < cfg.cooldownSec * 1000) {
+        res.status(200).json({ awarded: false, reason: 'cooldown', dailyXpEarned: currentDayTotal, dailyXpCap: DAILY_XP_CAP });
+        return;
+      }
+      if (currentDayTotal + cfg.amount > DAILY_XP_CAP) {
+        res.status(200).json({ awarded: false, reason: 'daily_cap', dailyXpEarned: currentDayTotal, dailyXpCap: DAILY_XP_CAP });
+        return;
+      }
+
+      const prevXp = Math.max(0, Math.floor(Number(userDoc.xp || 0)));
+      const nextXp = prevXp + cfg.amount;
+      const prevLevel = Math.max(1, Math.floor(Number(userDoc.level || 1)));
+      const boundedLevel = Math.min(Math.max(prevLevel, computeServerLevelFromXp(nextXp)), prevLevel + 1);
+      const nextDailyTotal = currentDayTotal + cfg.amount;
+
+      const nextActionMap: Record<string, string> = {};
+      for (const [k, v] of Object.entries(lastActionMap)) {
+        if (typeof v === 'string') nextActionMap[k] = v;
+      }
+      nextActionMap[action] = utc.nowIso;
+
+      await fsPatchDoc(
+        `users/${authUser.uid}`,
+        {
+          xp: nextXp,
+          level: boundedLevel,
+          dailyXpDate: utc.dateKey,
+          dailyXpEarned: nextDailyTotal,
+          xpActionLastAt: nextActionMap,
+          lastActiveAt: utc.nowIso,
+        },
+        token
+      );
+
+      const logId = `xp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      await fsCreateDoc(
+        'xpLogs',
+        logId,
+        {
+          id: logId,
+          userId: authUser.uid,
+          action,
+          amount: cfg.amount,
+          label: `${cfg.label}: ${String(liveDoc.title || '').slice(0, 40)}`,
+          createdAt: utc.nowIso,
+        },
+        token
+      ).catch(() => {});
+
+      res.status(200).json({
+        awarded: true,
+        xpDelta: cfg.amount,
+        xp: nextXp,
+        level: boundedLevel,
+        dailyXpEarned: nextDailyTotal,
+        dailyXpCap: DAILY_XP_CAP,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'تعذر احتساب نقاط البث.' });
     }
   });
 

@@ -13,13 +13,14 @@ import {
   LogOut,
   ShieldAlert,
   X,
-  LogIn
+  LogIn,
+  Radio
 } from 'lucide-react';
-import { ActiveTab, computeLevelFromXp, xpRequiredForLevel, getSortedUserTitles } from '../../types';
+import { ActiveTab, computeLevelFromXp, xpRequiredForLevel } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { MediaImage } from './MediaImage';
-import { CustomTitleBadge, LevelBadge, RoleBadge, VerifiedBadge } from './VerifiedBadge';
+import { LevelBadge, RoleBadge, VerifiedBadge } from './VerifiedBadge';
 
 interface NavigationDrawerProps {
   isOpen: boolean;
@@ -82,6 +83,7 @@ export function NavigationDrawer({
     { id: 'wiki', label: 'الويكي', icon: BookOpen },
     { id: 'reposts', label: 'إعادات النشر', icon: Repeat2 },
     { id: 'rooms', label: 'غرف الدردشة', icon: MessagesSquare },
+    { id: 'live', label: 'البث المباشر', icon: Radio },
     { id: 'events', label: 'الفعاليات', icon: Calendar },
   ];
 
@@ -209,9 +211,6 @@ export function NavigationDrawer({
                         {currentUser.customRoleName}
                       </span>
                     )}
-                    {getSortedUserTitles(currentUser).map((titleItem, idx) => (
-                      <CustomTitleBadge key={titleItem.id || `${titleItem.text}_${idx}`} title={titleItem} compact />
-                    ))}
                   </div>
                 </button>
 

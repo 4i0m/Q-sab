@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import {
   ShieldAlert,
   ShieldCheck,
@@ -24,13 +24,21 @@ import {
   Play,
   Plus,
   Edit3,
-  ImagePlus
+  ImagePlus,
+  Smile,
+  MessagesSquare,
+  Radio,
+  Award,
+  Lock,
+  Unlock,
+  RefreshCw,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import {
   ModerationReport,
   UserProfile,
   UserRole,
-  Post,
   VerificationRequest,
   VerificationCategory,
   AuditLog,
@@ -38,7 +46,11 @@ import {
   GlobalAdminRole,
   GlobalPermissionKey,
   PlatformAnnouncement,
-  PlatformAd
+  PlatformAd,
+  StickerPack,
+  ChatRoom,
+  LiveBroadcast,
+  computeLevelFromXp
 } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
@@ -48,7 +60,6 @@ import {
   listenToReports,
   updateReportResolution,
   getAllUsers,
-  listenToPosts,
   deletePostAsAdmin,
   listenToVerificationRequests,
   reviewVerificationRequest,
@@ -64,8 +75,15 @@ import {
   performGlobalRoleAction,
   listenToPlatformAnnouncements,
   listenToPlatformAds,
-  performBroadcastAction
+  performBroadcastAction,
+  getPlatformOverviewStats,
+  PlatformOverviewStats,
+  adminRoomAction,
+  adminAdjustUserXp
 } from '../../services/firestore';
+import { listenToAllChatRoomsForAdmin } from '../../services/chatRooms';
+import { listenToAllStickerPacks, moderateStickerPack } from '../../services/stickers';
+import { listenToLiveBroadcasts, moderateLiveBroadcast } from '../../services/live';
 import { uploadMedia } from '../../services/storage';
 import { VerifiedBadge, RoleBadge } from '../common/VerifiedBadge';
 import { formatRelativeTime } from '../../utils/date';
@@ -79,9 +97,34 @@ const GLOBAL_PERMISSION_LABELS: Array<{ key: GlobalPermissionKey; label: string 
   { key: 'manageAnnouncements', label: 'البيانات والإعلانات الرسمية' },
   { key: 'manageAds', label: 'الإعلانات الممولة' },
   { key: 'manageRooms', label: 'الرقابة على غرف الدردشة' },
+  { key: 'manageStickers', label: 'إدارة حزم الملصقات' },
+  { key: 'manageLive', label: 'الرقابة على البث المباشر' },
   { key: 'manageWiki', label: 'تعديل صفحات الويكي' },
   { key: 'viewAuditLogs', label: 'الاطلاع على سجل الرقابة' },
 ];
+
+const AUDIT_ACTION_LABELS: Record<string, string> = {
+  verification_review: 'مراجعة توثيق',
+  direct_verification: 'تعديل شارة توثيق',
+  warn_user: 'إنذار عضو',
+  suspend_user: 'تعليق حساب',
+  ban_user: 'حظر نهائي',
+  restore_user: 'استعادة حساب',
+  delete_post: 'حذف منشور',
+  report_action: 'معالجة بلاغ',
+  appeal_decision: 'قرار تظلم',
+  role_change: 'تعديل رتبة/صلاحية',
+  xp_adjust: 'تعديل XP',
+  room_delete: 'حذف غرفة',
+  sticker_submit: 'تقديم حزمة ملصقات',
+  sticker_approve: 'اعتماد ملصقات',
+  sticker_reject: 'رفض ملصقات',
+  sticker_disable: 'تعطيل/تفعيل ملصقات',
+  sticker_delete: 'حذف حزمة ملصقات',
+  live_start: 'بدء بث مباشر',
+  live_end: 'إنهاء بث مباشر',
+  live_moderate: 'إدارة بث مباشر',
+};
 
 const REPORT_TARGET_LABELS: Record<ModerationReport['targetType'], string> = {
   post: 'منشور',
@@ -109,20 +152,37 @@ export function ModerationView({ onBack }: ModerationViewProps) {
   const canReports = isStaff || Boolean(perms.manageUsers);
   const canRoles = isOwner || Boolean(perms.manageRoles);
   const canBroadcasts = isAdmin || Boolean(perms.manageAnnouncements || perms.manageAds);
+  const canStickers = isAdmin || Boolean(perms.manageStickers);
+  const canRooms = isAdmin || Boolean(perms.manageRooms);
+  const canLive = isAdmin || Boolean(perms.manageLive);
   const canAppeals = isAdmin;
   const canLogs = isAdmin || Boolean(perms.viewAuditLogs);
 
   const [activeTab, setActiveTab] = useState<
-    'overview' | 'verifications' | 'reports' | 'users' | 'roles' | 'broadcasts' | 'appeals' | 'logs'
+    | 'overview'
+    | 'verifications'
+    | 'reports'
+    | 'users'
+    | 'stickers'
+    | 'rooms'
+    | 'live'
+    | 'roles'
+    | 'broadcasts'
+    | 'appeals'
+    | 'logs'
   >('overview');
 
   // Real data state
+  const [metrics, setMetrics] = useState<PlatformOverviewStats | null>(null);
+  const [isRefreshingMetrics, setIsRefreshingMetrics] = useState(false);
   const [reports, setReports] = useState<ModerationReport[]>([]);
   const [verifications, setVerifications] = useState<VerificationRequest[]>([]);
   const [appeals, setAppeals] = useState<ModerationAppeal[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [users, setUsers] = useState<UserProfile[]>([]);
-  const [posts, setPosts] = useState<Post[]>([]);
+  const [stickerPacks, setStickerPacks] = useState<StickerPack[]>([]);
+  const [rooms, setRooms] = useState<ChatRoom[]>([]);
+  const [liveBroadcasts, setLiveBroadcasts] = useState<LiveBroadcast[]>([]);
   const [globalRoles, setGlobalRoles] = useState<GlobalAdminRole[]>([]);
   const [announcements, setAnnouncements] = useState<PlatformAnnouncement[]>([]);
   const [ads, setAds] = useState<PlatformAd[]>([]);
@@ -131,7 +191,13 @@ export function ModerationView({ onBack }: ModerationViewProps) {
   const [reportFilter, setReportFilter] = useState<'pending' | 'resolved' | 'dismissed' | 'all'>('pending');
   const [verificationFilter, setVerificationFilter] = useState<'pending' | 'approved' | 'rejected' | 'all'>('pending');
   const [appealFilter, setAppealFilter] = useState<'pending' | 'approved' | 'rejected' | 'all'>('pending');
+  const [stickerFilter, setStickerFilter] = useState<'pending' | 'approved' | 'rejected' | 'disabled' | 'all'>('pending');
+  const [liveFilter, setLiveFilter] = useState<'live' | 'ended' | 'all'>('live');
   const [userSearch, setUserSearch] = useState('');
+  const [roomSearch, setRoomSearch] = useState('');
+  const [logSearch, setLogSearch] = useState('');
+  const [logActionFilter, setLogActionFilter] = useState<string>('all');
+  const [logPage, setLogPage] = useState(1);
 
   // Custom Global Roles Manager state
   const [editingRoleId, setEditingRoleId] = useState<string | null>(null);
@@ -179,35 +245,73 @@ export function ModerationView({ onBack }: ModerationViewProps) {
   } | null>(null);
   const [appealNotes, setAppealNotes] = useState('');
   const [confirmDeleteReportPost, setConfirmDeleteReportPost] = useState<ModerationReport | null>(null);
+  const [xpModalUser, setXpModalUser] = useState<UserProfile | null>(null);
+  const [xpDeltaInput, setXpDeltaInput] = useState('50');
+  const [xpReasonInput, setXpReasonInput] = useState('');
+  const [stickerActionModal, setStickerActionModal] = useState<{
+    pack: StickerPack;
+    action: 'reject' | 'delete';
+  } | null>(null);
+  const [stickerActionNote, setStickerActionNote] = useState('');
+  const [roomDeleteModal, setRoomDeleteModal] = useState<ChatRoom | null>(null);
+  const [roomDeleteReason, setRoomDeleteReason] = useState('');
+  const [endLiveModal, setEndLiveModal] = useState<LiveBroadcast | null>(null);
+  const [endLiveReason, setEndLiveReason] = useState('');
   const [submittingModal, setSubmittingModal] = useState(false);
 
   const BackArrow = isRTL ? ArrowRight : ArrowLeft;
 
+  const refreshMetrics = async () => {
+    setIsRefreshingMetrics(true);
+    try {
+      const next = await getPlatformOverviewStats();
+      setMetrics(next);
+    } finally {
+      setIsRefreshingMetrics(false);
+    }
+  };
+
   useEffect(() => {
     if (!canAccessHub) return;
 
+    void refreshMetrics();
     const unsubReports = canReports ? listenToReports(setReports) : () => {};
-    const unsubPosts = listenToPosts(setPosts);
-    getAllUsers(100).then(setUsers);
+    getAllUsers(150).then(setUsers);
 
     const unsubVerifications = canVerifications ? listenToVerificationRequests(setVerifications) : () => {};
     const unsubAppeals = canAppeals ? listenToModerationAppeals(setAppeals) : () => {};
-    const unsubLogs = canLogs ? listenToAuditLogs(setAuditLogs) : () => {};
+    const unsubLogs = canLogs ? listenToAuditLogs(setAuditLogs, 200) : () => {};
     const unsubRoles = canRoles ? listenToGlobalAdminRoles(setGlobalRoles) : () => {};
     const unsubAnnouncements = canBroadcasts ? listenToPlatformAnnouncements(setAnnouncements) : () => {};
     const unsubAds = canBroadcasts ? listenToPlatformAds(setAds) : () => {};
+    const unsubStickers = canStickers ? listenToAllStickerPacks(setStickerPacks) : () => {};
+    const unsubRooms = canRooms ? listenToAllChatRoomsForAdmin(setRooms) : () => {};
+    const unsubLive = canLive ? listenToLiveBroadcasts(setLiveBroadcasts) : () => {};
 
     return () => {
       unsubReports();
-      unsubPosts();
       unsubVerifications();
       unsubAppeals();
       unsubLogs();
       unsubRoles();
       unsubAnnouncements();
       unsubAds();
+      unsubStickers();
+      unsubRooms();
+      unsubLive();
     };
-  }, [canAccessHub, canReports, canVerifications, canAppeals, canLogs, canRoles, canBroadcasts]);
+  }, [
+    canAccessHub,
+    canReports,
+    canVerifications,
+    canAppeals,
+    canLogs,
+    canRoles,
+    canBroadcasts,
+    canStickers,
+    canRooms,
+    canLive,
+  ]);
 
   // Handle Verification Review
   const handleReviewVerification = async (
@@ -582,12 +686,166 @@ export function ModerationView({ onBack }: ModerationViewProps) {
     }
   };
 
+  const submitXpAdjustment = async () => {
+    if (!xpModalUser || !canUsers) return;
+    const delta = Number(xpDeltaInput);
+    const reason = xpReasonInput.trim();
+    if (!Number.isFinite(delta) || delta === 0) {
+      showToast('يرجى إدخال قيمة XP صحيحة غير صفرية.', 'error');
+      return;
+    }
+    if (!reason) {
+      showToast('يرجى كتابة سبب تعديل نقاط الخبرة.', 'error');
+      return;
+    }
+    setSubmittingModal(true);
+    try {
+      const result = await adminAdjustUserXp(xpModalUser.id, delta, reason);
+      setUsers((prev) =>
+        prev.map((u) => (u.id === xpModalUser.id ? { ...u, xp: result.xp, level: result.level } : u))
+      );
+      showToast(
+        `تم تحديث رصيد @${xpModalUser.handle} إلى ${result.xp} XP (المستوى ${result.level})`,
+        'success'
+      );
+      setXpModalUser(null);
+      setXpDeltaInput('50');
+      setXpReasonInput('');
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'تعذر تعديل نقاط الخبرة.', 'error');
+    } finally {
+      setSubmittingModal(false);
+    }
+  };
+
+  const handleQuickStickerAction = async (
+    pack: StickerPack,
+    action: 'approve' | 'disable' | 'enable'
+  ) => {
+    try {
+      await moderateStickerPack({ packId: pack.id, action });
+      showToast(
+        action === 'approve'
+          ? `تم اعتماد حزمة "${pack.title}" ونشرها في المتجر.`
+          : action === 'disable'
+          ? `تم تعطيل حزمة "${pack.title}".`
+          : `تمت إعادة تفعيل حزمة "${pack.title}".`,
+        'success'
+      );
+      void refreshMetrics();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'تعذر تحديث حالة الحزمة.', 'error');
+    }
+  };
+
+  const submitStickerActionModal = async () => {
+    if (!stickerActionModal) return;
+    const note = stickerActionNote.trim();
+    if (stickerActionModal.action === 'reject' && !note) {
+      showToast('يرجى كتابة سبب الرفض.', 'error');
+      return;
+    }
+    setSubmittingModal(true);
+    try {
+      await moderateStickerPack({
+        packId: stickerActionModal.pack.id,
+        action: stickerActionModal.action,
+        note: note || undefined,
+      });
+      showToast(
+        stickerActionModal.action === 'reject' ? 'تم رفض حزمة الملصقات.' : 'تم حذف حزمة الملصقات نهائياً.',
+        'info'
+      );
+      setStickerActionModal(null);
+      setStickerActionNote('');
+      void refreshMetrics();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'تعذر تنفيذ الإجراء على الملصقات.', 'error');
+    } finally {
+      setSubmittingModal(false);
+    }
+  };
+
+  const handleToggleRoomReadOnly = async (room: ChatRoom) => {
+    try {
+      const res = await adminRoomAction({
+        roomId: room.id,
+        action: 'toggle_readonly',
+        reason: room.isReadOnly ? 'إعادة فتح الدردشة من لوحة الإدارة' : 'تفعيل وضع القراءة فقط من لوحة الإدارة',
+      });
+      showToast(res.isReadOnly ? `تم تفعيل القراءة فقط لغرفة "${room.title}"` : `تم فتح الدردشة في "${room.title}"`, 'info');
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'تعذر تعديل حالة الغرفة.', 'error');
+    }
+  };
+
+  const submitDeleteRoomModal = async () => {
+    if (!roomDeleteModal) return;
+    setSubmittingModal(true);
+    try {
+      await adminRoomAction({
+        roomId: roomDeleteModal.id,
+        action: 'delete_room',
+        reason: roomDeleteReason.trim() || 'حذف إداري من لوحة الإدارة',
+      });
+      showToast(`تم حذف غرفة "${roomDeleteModal.title}" نهائياً.`, 'info');
+      setRoomDeleteModal(null);
+      setRoomDeleteReason('');
+      void refreshMetrics();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'تعذر حذف الغرفة.', 'error');
+    } finally {
+      setSubmittingModal(false);
+    }
+  };
+
+  const submitEndLiveModal = async () => {
+    if (!endLiveModal) return;
+    setSubmittingModal(true);
+    try {
+      await moderateLiveBroadcast({
+        broadcastId: endLiveModal.id,
+        action: 'end_broadcast',
+        reason: endLiveReason.trim() || 'إغلاق إداري للبث المباشر',
+      });
+      showToast(`تم إنهاء البث "${endLiveModal.title}".`, 'info');
+      setEndLiveModal(null);
+      setEndLiveReason('');
+      void refreshMetrics();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'تعذر إنهاء البث.', 'error');
+    } finally {
+      setSubmittingModal(false);
+    }
+  };
+
+  const filteredLogs = useMemo(() => {
+    const q = logSearch.trim().toLowerCase();
+    return auditLogs.filter((log) => {
+      if (logActionFilter !== 'all' && log.actionType !== logActionFilter) return false;
+      if (!q) return true;
+      return (
+        (log.actorName || '').toLowerCase().includes(q) ||
+        (log.targetDetails || '').toLowerCase().includes(q) ||
+        (log.actionType || '').toLowerCase().includes(q)
+      );
+    });
+  }, [auditLogs, logActionFilter, logSearch]);
+
+  const LOGS_PER_PAGE = 20;
+  const totalLogPages = Math.max(1, Math.ceil(filteredLogs.length / LOGS_PER_PAGE));
+  const safeLogPage = Math.min(logPage, totalLogPages);
+  const paginatedLogs = useMemo(
+    () => filteredLogs.slice((safeLogPage - 1) * LOGS_PER_PAGE, safeLogPage * LOGS_PER_PAGE),
+    [filteredLogs, safeLogPage]
+  );
+
   if (!canAccessHub) {
     return (
-      <div className="w-full max-w-md mx-auto py-20 text-center bg-white dark:bg-[#161B26] border border-red-500/30 rounded-3xl p-6 shadow-2xl font-tajawal">
-        <ShieldAlert className="w-12 h-12 text-red-500 mx-auto mb-3" />
-        <h2 className="text-base font-bold text-slate-900 dark:text-white">صلاحية محظورة</h2>
-        <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+      <div className="w-full max-w-md mx-auto py-20 text-center bg-[#0B1120] border border-rose-500/30 rounded-3xl p-6 shadow-2xl font-tajawal text-slate-100">
+        <ShieldAlert className="w-12 h-12 text-rose-400 mx-auto mb-3" />
+        <h2 className="text-base font-bold text-white">صلاحية محظورة</h2>
+        <p className="text-xs text-slate-400 mt-1">
           هذه الواجهة مخصصة لمشرفي وإداريي منصة Q المعتمدين فقط.
         </p>
       </div>
@@ -595,32 +853,36 @@ export function ModerationView({ onBack }: ModerationViewProps) {
   }
 
   return (
-    <div className="w-full max-w-2xl mx-auto pb-24 space-y-4 font-tajawal">
-      {/* Top Header */}
-      <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-[#2A2F3A]">
-        <div className="flex items-center gap-3">
+    <div className="w-full max-w-3xl mx-auto pb-24 space-y-4 font-tajawal bg-[#0B1120] text-slate-100 rounded-3xl border border-[#D4AF37]/20 p-4 sm:p-5">
+      {/* Top Header — Midnight Navy & Muted Gold */}
+      <div className="flex items-center justify-between gap-3 pb-3.5 border-b border-slate-800">
+        <div className="flex items-center gap-3 min-w-0">
           {onBack && (
             <button
+              type="button"
               onClick={onBack}
-              className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-colors"
+              className="min-w-[44px] min-h-[44px] rounded-xl border border-slate-800 bg-[#111827] text-slate-300 hover:text-[#D4AF37] hover:border-[#D4AF37]/40 flex items-center justify-center transition-colors cursor-pointer shrink-0"
+              aria-label="رجوع"
             >
               <BackArrow className="w-5 h-5" />
             </button>
           )}
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="w-6 h-6 text-[#3B6DFF]" />
-            <div>
-              <h1 className="text-base font-bold text-slate-900 dark:text-white">
-                مركز الإدارة والرقابة الشامل
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-10 h-10 rounded-xl bg-[#D4AF37]/10 border border-[#D4AF37]/30 flex items-center justify-center shrink-0">
+              <ShieldCheck className="w-5 h-5 text-[#D4AF37]" />
+            </div>
+            <div className="min-w-0">
+              <h1 className="text-base font-extrabold text-white truncate">
+                مركز القيادة والرقابة الإدارية
               </h1>
-              <span className="text-[10px] text-slate-500 dark:text-slate-400 block">
-                الرقابة • البلاغات • التوثيق • إدارة الأعضاء
+              <span className="text-[11px] text-slate-400 block truncate">
+                إدارة المنصة • الصلاحيات • الغرف • الملصقات • البث المباشر
               </span>
             </div>
           </div>
         </div>
 
-        <span className="px-3 py-1 rounded-xl bg-[#3B6DFF]/10 dark:bg-[#3B6DFF]/15 border border-[#3B6DFF]/30 text-xs font-bold text-[#3B6DFF] dark:text-[#4F8CFF]">
+        <span className="px-3 py-1.5 rounded-xl bg-[#D4AF37]/10 border border-[#D4AF37]/35 text-xs font-bold text-[#D4AF37] shrink-0">
           {currentUser?.customRoleName
             ? currentUser.customRoleName
             : currentUser?.role === 'owner'
@@ -636,193 +898,164 @@ export function ModerationView({ onBack }: ModerationViewProps) {
       </div>
 
       {/* Navigation Tabs */}
-      <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none border-b border-slate-200 dark:border-[#2A2F3A]">
-        <button
-          onClick={() => setActiveTab('overview')}
-          className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 cursor-pointer ${
-            activeTab === 'overview'
-              ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-              : 'bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-          }`}
-        >
-          <Activity className="w-3.5 h-3.5" />
-          <span>نظرة عامة</span>
-        </button>
-
-        {canVerifications && (
-          <button
-            onClick={() => setActiveTab('verifications')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 cursor-pointer ${
-              activeTab === 'verifications'
-                ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-                : 'bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <BadgeCheck className="w-3.5 h-3.5" />
-            <span>طلبات التوثيق ({verifications.filter((v) => v.status === 'pending').length})</span>
-          </button>
-        )}
-
-        {canReports && (
-          <button
-            onClick={() => setActiveTab('reports')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 cursor-pointer ${
-              activeTab === 'reports'
-                ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-                : 'bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <AlertTriangle className="w-3.5 h-3.5" />
-            <span>البلاغات ({reports.filter((r) => r.status === 'pending').length})</span>
-          </button>
-        )}
-
-        {canUsers && (
-          <button
-            onClick={() => setActiveTab('users')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 cursor-pointer ${
-              activeTab === 'users'
-                ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-                : 'bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <Users className="w-3.5 h-3.5" />
-            <span>إدارة الأعضاء</span>
-          </button>
-        )}
-
-        {canRoles && (
-          <button
-            onClick={() => setActiveTab('roles')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 cursor-pointer ${
-              activeTab === 'roles'
-                ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-                : 'bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <KeyRound className="w-3.5 h-3.5" />
-            <span>الرتب والصلاحيات</span>
-          </button>
-        )}
-
-        {canBroadcasts && (
-          <button
-            onClick={() => setActiveTab('broadcasts')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 cursor-pointer ${
-              activeTab === 'broadcasts'
-                ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-                : 'bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <Megaphone className="w-3.5 h-3.5" />
-            <span>الإعلانات الرسمية</span>
-          </button>
-        )}
-
-        {canAppeals && (
-          <button
-            onClick={() => setActiveTab('appeals')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 cursor-pointer ${
-              activeTab === 'appeals'
-                ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-                : 'bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <Scale className="w-3.5 h-3.5" />
-            <span>التظلمات ({appeals.filter((a) => a.status === 'pending').length})</span>
-          </button>
-        )}
-
-        {canLogs && (
-          <button
-            onClick={() => setActiveTab('logs')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all shrink-0 flex items-center gap-1.5 cursor-pointer ${
-              activeTab === 'logs'
-                ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-                : 'bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            <FileText className="w-3.5 h-3.5" />
-            <span>سجل الرقابة ({auditLogs.length})</span>
-          </button>
-        )}
+      <div className="flex items-center gap-1.5 overflow-x-auto pb-2 scrollbar-none border-b border-slate-800">
+        {[
+          { id: 'overview' as const, label: 'نظرة عامة', icon: Activity, visible: true },
+          {
+            id: 'verifications' as const,
+            label: `التوثيق (${metrics?.pendingVerifications ?? verifications.filter((v) => v.status === 'pending').length})`,
+            icon: BadgeCheck,
+            visible: canVerifications,
+          },
+          {
+            id: 'reports' as const,
+            label: `البلاغات (${metrics?.pendingReports ?? reports.filter((r) => r.status === 'pending').length})`,
+            icon: AlertTriangle,
+            visible: canReports,
+          },
+          { id: 'users' as const, label: 'الأعضاء والخبرة', icon: Users, visible: canUsers },
+          {
+            id: 'stickers' as const,
+            label: `الملصقات (${stickerPacks.filter((s) => s.status === 'pending').length})`,
+            icon: Smile,
+            visible: canStickers,
+          },
+          { id: 'rooms' as const, label: `الغرف (${rooms.length})`, icon: MessagesSquare, visible: canRooms },
+          {
+            id: 'live' as const,
+            label: `البث المباشر (${liveBroadcasts.filter((b) => b.status === 'live').length})`,
+            icon: Radio,
+            visible: canLive,
+          },
+          { id: 'roles' as const, label: 'الرتب والصلاحيات', icon: KeyRound, visible: canRoles },
+          { id: 'broadcasts' as const, label: 'البيانات والإعلانات', icon: Megaphone, visible: canBroadcasts },
+          {
+            id: 'appeals' as const,
+            label: `التظلمات (${metrics?.pendingAppeals ?? appeals.filter((a) => a.status === 'pending').length})`,
+            icon: Scale,
+            visible: canAppeals,
+          },
+          { id: 'logs' as const, label: `سجل الرقابة (${auditLogs.length})`, icon: FileText, visible: canLogs },
+        ]
+          .filter((tab) => tab.visible)
+          .map((tab) => {
+            const Icon = tab.icon;
+            const isActive = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setActiveTab(tab.id)}
+                className={`min-h-[44px] px-3.5 py-2 rounded-xl text-xs font-bold transition-colors shrink-0 flex items-center gap-1.5 cursor-pointer border ${
+                  isActive
+                    ? 'bg-[#D4AF37] text-[#0B1120] border-[#D4AF37]'
+                    : 'bg-[#111827] border-slate-800 text-slate-300 hover:text-white hover:border-[#D4AF37]/40'
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5 shrink-0" />
+                <span>{tab.label}</span>
+              </button>
+            );
+          })}
       </div>
 
       {/* 1. OVERVIEW DASHBOARD */}
       {activeTab === 'overview' && (
         <div className="space-y-4">
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            <div className="p-3.5 rounded-2xl bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A]">
-              <span className="text-[10px] uppercase font-bold text-slate-500 block">
-                الأعضاء المسجلون
-              </span>
-              <div className="text-xl font-bold text-slate-900 dark:text-white mt-1 tabular-nums">
-                {users.length}
-              </div>
-            </div>
-
-            <div className="p-3.5 rounded-2xl bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A]">
-              <span className="text-[10px] uppercase font-bold text-slate-500 block">
-                المنشورات الفعلية
-              </span>
-              <div className="text-xl font-bold text-slate-900 dark:text-white mt-1 tabular-nums">
-                {posts.length}
-              </div>
-            </div>
-
-            <div className="p-3.5 rounded-2xl bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A]">
-              <span className="text-[10px] uppercase font-bold text-slate-500 block">
-                المتصلون الآن
-              </span>
-              <div className="text-xl font-bold text-emerald-600 dark:text-emerald-400 mt-1 flex items-center gap-1.5 tabular-nums">
-                <span className="w-2 h-2 rounded-full bg-emerald-500" />
-                <span>{onlineCount}</span>
-              </div>
-            </div>
-
-            <div className="p-3.5 rounded-2xl bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A]">
-              <span className="text-[10px] uppercase font-bold text-slate-500 block">
-                بلاغات قيد الفحص
-              </span>
-              <div className="text-xl font-bold text-rose-600 dark:text-rose-400 mt-1 tabular-nums">
-                {reports.filter((r) => r.status === 'pending').length}
-              </div>
-            </div>
-
-            {isAdmin && (
-              <>
-                <div className="p-3.5 rounded-2xl bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A]">
-                  <span className="text-[10px] uppercase font-bold text-slate-500 block">
-                    طلبات التوثيق المعلقة
-                  </span>
-                  <div className="text-xl font-bold text-[#3B6DFF] dark:text-[#4F8CFF] mt-1 tabular-nums">
-                    {verifications.filter((v) => v.status === 'pending').length}
-                  </div>
-                </div>
-
-                <div className="p-3.5 rounded-2xl bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A]">
-                  <span className="text-[10px] uppercase font-bold text-slate-500 block">
-                    تظلمات قيد المراجعة
-                  </span>
-                  <div className="text-xl font-bold text-sky-600 dark:text-sky-400 mt-1 tabular-nums">
-                    {appeals.filter((a) => a.status === 'pending').length}
-                  </div>
-                </div>
-              </>
-            )}
+          <div className="flex items-center justify-between">
+            <h2 className="text-xs font-bold text-[#D4AF37]">مؤشرات المنصة الفعلية المباشرة</h2>
+            <button
+              type="button"
+              onClick={() => void refreshMetrics()}
+              disabled={isRefreshingMetrics}
+              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-[#111827] border border-slate-800 hover:border-[#D4AF37]/40 text-[11px] font-bold text-slate-300 flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 text-[#D4AF37] ${isRefreshingMetrics ? 'animate-spin' : ''}`} />
+              <span>تحديث المؤشرات</span>
+            </button>
           </div>
 
-          <div className="p-4 rounded-2xl bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] space-y-2">
-            <h3 className="text-xs font-bold text-[#3B6DFF] dark:text-[#4F8CFF] flex items-center gap-1.5">
-              <ShieldCheck className="w-4 h-4 text-[#3B6DFF]" />
-              <span>سياسات منظومة التوثيق والرقابة</span>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            <div className="p-3.5 rounded-2xl bg-[#111827] border border-slate-800">
+              <span className="text-[11px] font-bold text-slate-400 block">الأعضاء المسجلون</span>
+              <div className="text-xl font-extrabold text-white mt-1 tabular-nums">
+                {metrics ? metrics.totalUsers : users.length}
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-[#111827] border border-slate-800">
+              <span className="text-[11px] font-bold text-slate-400 block">المنشورات الفعلية</span>
+              <div className="text-xl font-extrabold text-white mt-1 tabular-nums">
+                {metrics ? metrics.totalPosts : '—'}
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-[#111827] border border-slate-800">
+              <span className="text-[11px] font-bold text-slate-400 block">المتصلون الآن</span>
+              <div className="text-xl font-extrabold text-emerald-400 mt-1 tabular-nums">
+                {onlineCount}
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-[#111827] border border-slate-800">
+              <span className="text-[11px] font-bold text-slate-400 block">غرف الدردشة</span>
+              <div className="text-xl font-extrabold text-[#D4AF37] mt-1 tabular-nums">
+                {metrics ? metrics.totalRooms : rooms.length}
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-[#111827] border border-slate-800">
+              <span className="text-[11px] font-bold text-slate-400 block">الفعاليات</span>
+              <div className="text-xl font-extrabold text-sky-400 mt-1 tabular-nums">
+                {metrics ? metrics.totalEvents : '—'}
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-[#111827] border border-slate-800">
+              <span className="text-[11px] font-bold text-slate-400 block">البث المباشر النشط</span>
+              <div className="text-xl font-extrabold text-rose-400 mt-1 tabular-nums">
+                {metrics ? metrics.activeLive : liveBroadcasts.filter((b) => b.status === 'live').length}
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-[#111827] border border-slate-800">
+              <span className="text-[11px] font-bold text-slate-400 block">بلاغات قيد الفحص</span>
+              <div className="text-xl font-extrabold text-rose-400 mt-1 tabular-nums">
+                {metrics ? metrics.pendingReports : reports.filter((r) => r.status === 'pending').length}
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-[#111827] border border-slate-800">
+              <span className="text-[11px] font-bold text-slate-400 block">طلبات التوثيق المعلقة</span>
+              <div className="text-xl font-extrabold text-sky-400 mt-1 tabular-nums">
+                {metrics ? metrics.pendingVerifications : verifications.filter((v) => v.status === 'pending').length}
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-[#111827] border border-slate-800">
+              <span className="text-[11px] font-bold text-slate-400 block">حزم ملصقات بانتظار المراجعة</span>
+              <div className="text-xl font-extrabold text-[#D4AF37] mt-1 tabular-nums">
+                {metrics ? metrics.pendingStickers : stickerPacks.filter((s) => s.status === 'pending').length}
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-[#111827] border border-slate-800 sm:col-span-3">
+              <span className="text-[11px] font-bold text-slate-400 block">تظلمات قيد المراجعة</span>
+              <div className="text-xl font-extrabold text-amber-400 mt-1 tabular-nums">
+                {metrics ? metrics.pendingAppeals : appeals.filter((a) => a.status === 'pending').length}
+              </div>
+            </div>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-[#111827] border border-[#D4AF37]/25 space-y-2">
+            <h3 className="text-xs font-bold text-[#D4AF37] flex items-center gap-1.5">
+              <ShieldCheck className="w-4 h-4 text-[#D4AF37]" />
+              <span>حوكمة التوثيق والصلاحيات في Q</span>
             </h3>
-            <ul className="text-xs text-slate-600 dark:text-slate-300 space-y-1 list-disc list-inside leading-relaxed">
-              <li>التوثيق الأزرق (Blue): مخصص ومحفوظ للشخصيات العامة والحسابات المعتمدة.</li>
-              <li>التوثيق الفضي (Silver): للأفراد البارزين والمهنيين والمبدعين بعد المراجعة.</li>
-              <li>التوثيق المؤسسي (Institution): للشركات والمؤسسات والجهات الرسمية.</li>
-              <li>التوثيق الملكي الدموي (Blood-Red): استثنائي ويقتصر حصرياً على مالك المنصة (Owner).</li>
-              <li>كل إجراء رقابي يُسجل في سجل العمليات الثابت (Audit Logs) باسم المشرف وتاريخه.</li>
+            <ul className="text-xs text-slate-300 space-y-1 list-disc list-inside leading-relaxed">
+              <li>كل إجراء رقابي (منح XP، حظر، حذف غرفة، اعتماد ملصقات، إنهاء بث) يُنفذ عبر الخادم ويُسجل في Audit Logs.</li>
+              <li>التوثيق الملكي الدموي (Blood-Red) وتعيين رتبة المدير العام يقتصران حصراً على مالك المنصة.</li>
+              <li>المؤشرات أعلاه مأخوذة مباشرة من قاعدة البيانات الفعلية عبر /api/admin/metrics دون أي قيم ثابتة.</li>
             </ul>
           </div>
         </div>
@@ -1022,7 +1255,7 @@ export function ModerationView({ onBack }: ModerationViewProps) {
                             )}
                           </div>
                           <span className="text-[10px] text-slate-500 tabular-nums">
-                            @{targetUser.handle} • {targetUser.followersCount || 0} متابع
+                            @{targetUser.handle} • {targetUser.followersCount || 0} متابع • Lv.{targetUser.level || computeLevelFromXp(targetUser.xp || 0)} ({targetUser.xp || 0} XP)
                           </span>
                         </div>
                       </div>
@@ -1063,7 +1296,7 @@ export function ModerationView({ onBack }: ModerationViewProps) {
                               : 'bg-white dark:bg-[#0B0F19] border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400'
                           }`}
                         >
-                          <VerifiedBadge category="blue" className="w-3 h-3" />
+                          <VerifiedBadge category="blue" className="w-3 h-3" interactive={false} />
                           <span>أزرق</span>
                         </button>
 
@@ -1075,7 +1308,7 @@ export function ModerationView({ onBack }: ModerationViewProps) {
                               : 'bg-white dark:bg-[#0B0F19] border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400'
                           }`}
                         >
-                          <VerifiedBadge category="silver" className="w-3 h-3" />
+                          <VerifiedBadge category="silver" className="w-3 h-3" interactive={false} />
                           <span>فضي</span>
                         </button>
 
@@ -1090,7 +1323,7 @@ export function ModerationView({ onBack }: ModerationViewProps) {
                               : 'bg-white dark:bg-[#0B0F19] border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-slate-400'
                           }`}
                         >
-                          <VerifiedBadge category="institution" className="w-3 h-3" />
+                          <VerifiedBadge category="institution" className="w-3 h-3" interactive={false} />
                           <span>مؤسسي</span>
                         </button>
 
@@ -1109,7 +1342,7 @@ export function ModerationView({ onBack }: ModerationViewProps) {
                               : 'bg-slate-100 dark:bg-[#0B0F19] border-slate-200 dark:border-[#2A2F3A] text-slate-400 cursor-not-allowed opacity-50'
                           }`}
                         >
-                          <VerifiedBadge category="blood_red" className="w-3 h-3" />
+                          <VerifiedBadge category="blood_red" className="w-3 h-3" interactive={false} />
                           <span>ملكي</span>
                         </button>
                       </div>
@@ -1117,11 +1350,25 @@ export function ModerationView({ onBack }: ModerationViewProps) {
 
                     <div className="flex items-center gap-1.5 pt-1 overflow-x-auto scrollbar-none">
                       <button
+                        type="button"
+                        onClick={() => {
+                          setXpModalUser(targetUser);
+                          setXpDeltaInput('50');
+                          setXpReasonInput('');
+                        }}
+                        className="min-h-[36px] px-2.5 py-1 rounded-lg bg-[#D4AF37]/15 border border-[#D4AF37]/40 text-[#D4AF37] text-[11px] font-bold flex items-center gap-1 cursor-pointer shrink-0"
+                      >
+                        <Award className="w-3 h-3" />
+                        <span>تعديل XP</span>
+                      </button>
+
+                      <button
+                        type="button"
                         onClick={() => {
                           setPenaltyModal({ type: 'warn', targetUser });
                           setPenaltyReason('');
                         }}
-                        className="px-2.5 py-1 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-700 dark:text-amber-300 text-[11px] flex items-center gap-1"
+                        className="min-h-[36px] px-2.5 py-1 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 text-[11px] flex items-center gap-1 cursor-pointer shrink-0"
                       >
                         <AlertTriangle className="w-3 h-3" />
                         <span>إنذار ({targetUser.warningCount || 0})</span>
@@ -1129,19 +1376,21 @@ export function ModerationView({ onBack }: ModerationViewProps) {
 
                       {!targetUser.isSuspended ? (
                         <button
+                          type="button"
                           onClick={() => {
                             setPenaltyModal({ type: 'suspend', targetUser });
                             setPenaltyReason('');
                           }}
-                          className="px-2.5 py-1 rounded-lg bg-orange-500/10 border border-orange-500/30 text-orange-700 dark:text-orange-300 text-[11px] flex items-center gap-1"
+                          className="min-h-[36px] px-2.5 py-1 rounded-lg bg-orange-500/10 border border-orange-500/30 text-orange-400 text-[11px] flex items-center gap-1 cursor-pointer shrink-0"
                         >
                           <Clock className="w-3 h-3" />
                           <span>تعليق مؤقت</span>
                         </button>
                       ) : (
                         <button
+                          type="button"
                           onClick={() => handleRestoreUser(targetUser)}
-                          className="px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 text-[11px] flex items-center gap-1"
+                          className="min-h-[36px] px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-[11px] flex items-center gap-1 cursor-pointer shrink-0"
                         >
                           <RotateCcw className="w-3 h-3" />
                           <span>رفع التعليق</span>
@@ -1150,19 +1399,21 @@ export function ModerationView({ onBack }: ModerationViewProps) {
 
                       {!targetUser.isBanned ? (
                         <button
+                          type="button"
                           onClick={() => {
                             setPenaltyModal({ type: 'ban', targetUser });
                             setPenaltyReason('');
                           }}
-                          className="px-2.5 py-1 rounded-lg bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-300 text-[11px] flex items-center gap-1"
+                          className="min-h-[36px] px-2.5 py-1 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-[11px] flex items-center gap-1 cursor-pointer shrink-0"
                         >
                           <Ban className="w-3 h-3" />
                           <span>حظر نهائي</span>
                         </button>
                       ) : (
                         <button
+                          type="button"
                           onClick={() => handleRestoreUser(targetUser)}
-                          className="px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 text-[11px] flex items-center gap-1"
+                          className="min-h-[36px] px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-[11px] flex items-center gap-1 cursor-pointer shrink-0"
                         >
                           <RotateCcw className="w-3 h-3" />
                           <span>إلغاء الحظر</span>
@@ -1172,6 +1423,316 @@ export function ModerationView({ onBack }: ModerationViewProps) {
                   </div>
                 );
               })}
+          </div>
+        </div>
+      )}
+
+      {/* 3B. STICKER PACKS MODERATION */}
+      {activeTab === 'stickers' && canStickers && (
+        <div className="space-y-3">
+          <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
+            {(['pending', 'approved', 'rejected', 'disabled', 'all'] as const).map((st) => (
+              <button
+                key={st}
+                type="button"
+                onClick={() => setStickerFilter(st)}
+                className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 cursor-pointer border ${
+                  stickerFilter === st
+                    ? 'bg-[#D4AF37] text-[#0B1120] border-[#D4AF37]'
+                    : 'bg-[#111827] border-slate-800 text-slate-300 hover:text-white'
+                }`}
+              >
+                {st === 'pending' && 'قيد المراجعة'}
+                {st === 'approved' && 'معتمدة'}
+                {st === 'rejected' && 'مرفوضة'}
+                {st === 'disabled' && 'معطّلة'}
+                {st === 'all' && 'الكل'}
+              </button>
+            ))}
+          </div>
+
+          {stickerPacks
+            .filter((p) => stickerFilter === 'all' || p.status === stickerFilter)
+            .map((pack) => (
+              <div
+                key={pack.id}
+                className="p-4 rounded-2xl bg-[#111827] border border-slate-800 space-y-3"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    {pack.coverURL ? (
+                      <img
+                        src={pack.coverURL}
+                        alt={pack.title}
+                        className="w-12 h-12 rounded-xl object-contain bg-[#0B1120] border border-slate-800 p-1 shrink-0"
+                      />
+                    ) : (
+                      <div className="w-12 h-12 rounded-xl bg-[#0B1120] border border-slate-800 flex items-center justify-center shrink-0">
+                        <Smile className="w-5 h-5 text-[#D4AF37]" />
+                      </div>
+                    )}
+                    <div className="min-w-0">
+                      <h4 className="text-xs font-extrabold text-white truncate">{pack.title}</h4>
+                      <p className="text-[11px] text-slate-400 truncate">
+                        بواسطة {pack.authorName} • <span className="tabular-nums">{pack.stickers?.length || 0}</span> ملصق • <span className="tabular-nums">{pack.installsCount || 0}</span> حفظ
+                      </p>
+                      {pack.description && (
+                        <p className="text-[11px] text-slate-400 mt-0.5 line-clamp-1">{pack.description}</p>
+                      )}
+                    </div>
+                  </div>
+                  <span
+                    className={`px-2 py-0.5 rounded-lg text-[10px] font-bold shrink-0 ${
+                      pack.status === 'approved' && pack.isEnabled
+                        ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                        : pack.status === 'pending'
+                        ? 'bg-[#D4AF37]/15 text-[#D4AF37] border border-[#D4AF37]/30'
+                        : 'bg-rose-500/15 text-rose-400 border border-rose-500/30'
+                    }`}
+                  >
+                    {pack.status === 'pending'
+                      ? 'معلّقة'
+                      : pack.status === 'approved'
+                      ? pack.isEnabled
+                        ? 'معتمدة'
+                        : 'معطّلة'
+                      : pack.status === 'rejected'
+                      ? 'مرفوضة'
+                      : 'معطّلة'}
+                  </span>
+                </div>
+
+                {Array.isArray(pack.stickers) && pack.stickers.length > 0 && (
+                  <div className="flex items-center gap-2 overflow-x-auto py-1 scrollbar-none">
+                    {pack.stickers.slice(0, 12).map((st) => (
+                      <img
+                        key={st.id}
+                        src={st.url}
+                        alt={st.label || 'ملصق'}
+                        className="w-12 h-12 rounded-xl object-contain bg-[#0B1120] border border-slate-800 p-1 shrink-0"
+                      />
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  {pack.status !== 'approved' && (
+                    <button
+                      type="button"
+                      onClick={() => void handleQuickStickerAction(pack, 'approve')}
+                      className="min-h-[40px] px-3 py-1.5 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <CheckCircle className="w-3.5 h-3.5" />
+                      <span>اعتماد</span>
+                    </button>
+                  )}
+
+                  {pack.status === 'pending' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStickerActionModal({ pack, action: 'reject' });
+                        setStickerActionNote('');
+                      }}
+                      className="min-h-[40px] px-3 py-1.5 rounded-xl bg-amber-500/15 border border-amber-500/40 text-amber-300 text-xs font-bold cursor-pointer"
+                    >
+                      رفض
+                    </button>
+                  )}
+
+                  {pack.status === 'approved' && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void handleQuickStickerAction(pack, pack.isEnabled ? 'disable' : 'enable')
+                      }
+                      className="min-h-[40px] px-3 py-1.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-200 text-xs font-bold cursor-pointer"
+                    >
+                      {pack.isEnabled ? 'تعطيل مؤقت' : 'إعادة تفعيل'}
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setStickerActionModal({ pack, action: 'delete' });
+                      setStickerActionNote('');
+                    }}
+                    className="min-h-[40px] px-3 py-1.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-rose-300 text-xs font-bold flex items-center gap-1 cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>حذف</span>
+                  </button>
+                </div>
+              </div>
+            ))}
+
+          {stickerPacks.filter((p) => stickerFilter === 'all' || p.status === stickerFilter).length === 0 && (
+            <div className="py-12 text-center bg-[#111827] border border-slate-800 rounded-2xl p-6">
+              <Smile className="w-8 h-8 text-[#D4AF37] mx-auto mb-2" />
+              <p className="text-xs text-slate-400">لا توجد حزم ملصقات ضمن هذا التصنيف.</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 3C. CHAT ROOMS ADMINISTRATION */}
+      {activeTab === 'rooms' && canRooms && (
+        <div className="space-y-3">
+          <div className="relative">
+            <input
+              type="text"
+              value={roomSearch}
+              onChange={(e) => setRoomSearch(e.target.value)}
+              placeholder="ابحث عن غرفة بالاسم أو اسم المالك..."
+              className="w-full bg-[#111827] border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-[#D4AF37]"
+            />
+            <Search className="absolute end-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+          </div>
+
+          <div className="space-y-2.5">
+            {rooms
+              .filter(
+                (r) =>
+                  !roomSearch.trim() ||
+                  r.title.toLowerCase().includes(roomSearch.toLowerCase()) ||
+                  (r.ownerName || '').toLowerCase().includes(roomSearch.toLowerCase())
+              )
+              .map((room) => (
+                <div
+                  key={room.id}
+                  className="p-4 rounded-2xl bg-[#111827] border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                >
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-extrabold text-white truncate">{room.title}</span>
+                      <span className="px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 text-[10px] font-bold">
+                        {room.visibility === 'public'
+                          ? 'عامة'
+                          : room.visibility === 'private'
+                          ? 'خاصة'
+                          : 'بدعوة'}
+                      </span>
+                      {room.isReadOnly && (
+                        <span className="px-2 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/30 text-amber-300 text-[10px] font-bold">
+                          قراءة فقط
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-slate-400 tabular-nums">
+                      المالك: {room.ownerName} • {room.memberCount || 0} عضو
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => void handleToggleRoomReadOnly(room)}
+                      className="min-h-[40px] px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      {room.isReadOnly ? <Unlock className="w-3.5 h-3.5 text-emerald-400" /> : <Lock className="w-3.5 h-3.5 text-amber-400" />}
+                      <span>{room.isReadOnly ? 'فتح الكتابة' : 'قراءة فقط'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRoomDeleteModal(room);
+                        setRoomDeleteReason('');
+                      }}
+                      className="min-h-[40px] px-3 py-1.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-rose-300 hover:bg-rose-500/25 text-xs font-bold flex items-center gap-1 cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>حذف</span>
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+            {rooms.length === 0 && (
+              <div className="py-12 text-center bg-[#111827] border border-slate-800 rounded-2xl p-6">
+                <MessagesSquare className="w-8 h-8 text-[#D4AF37] mx-auto mb-2" />
+                <p className="text-xs text-slate-400">لا توجد غرف دردشة منشأة حالياً.</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 3D. LIVE BROADCASTS MODERATION */}
+      {activeTab === 'live' && canLive && (
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            {(['live', 'ended', 'all'] as const).map((st) => (
+              <button
+                key={st}
+                type="button"
+                onClick={() => setLiveFilter(st)}
+                className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer border ${
+                  liveFilter === st
+                    ? 'bg-[#D4AF37] text-[#0B1120] border-[#D4AF37]'
+                    : 'bg-[#111827] border-slate-800 text-slate-300 hover:text-white'
+                }`}
+              >
+                {st === 'live' && 'مباشر الآن'}
+                {st === 'ended' && 'منتهية'}
+                {st === 'all' && 'الكل'}
+              </button>
+            ))}
+          </div>
+
+          <div className="space-y-2.5">
+            {liveBroadcasts
+              .filter((b) => liveFilter === 'all' || b.status === liveFilter)
+              .map((b) => (
+                <div
+                  key={b.id}
+                  className="p-4 rounded-2xl bg-[#111827] border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                >
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span
+                        className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
+                          b.status === 'live'
+                            ? 'bg-rose-500/20 border border-rose-500/40 text-rose-300'
+                            : 'bg-slate-800 text-slate-400'
+                        }`}
+                      >
+                        {b.status === 'live' ? 'LIVE' : 'منتهي'}
+                      </span>
+                      <span className="text-xs font-extrabold text-white truncate">{b.title}</span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 tabular-nums">
+                      المضيف: {b.hostName} • الوضع:{' '}
+                      {b.mode === 'youtube_embed'
+                        ? 'YouTube'
+                        : b.mode === 'external_stream'
+                        ? 'رابط بث خارجي'
+                        : 'كاميرا/شاشة WebRTC'}{' '}
+                      • {b.viewerCount || 0} مشاهد
+                    </p>
+                  </div>
+
+                  {b.status === 'live' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEndLiveModal(b);
+                        setEndLiveReason('');
+                      }}
+                      className="min-h-[40px] px-3.5 py-1.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-rose-300 hover:bg-rose-500/25 text-xs font-bold cursor-pointer shrink-0"
+                    >
+                      إنهاء البث إدارياً
+                    </button>
+                  )}
+                </div>
+              ))}
+
+            {liveBroadcasts.filter((b) => liveFilter === 'all' || b.status === liveFilter).length === 0 && (
+              <div className="py-12 text-center bg-[#111827] border border-slate-800 rounded-2xl p-6">
+                <Radio className="w-8 h-8 text-[#D4AF37] mx-auto mb-2" />
+                <p className="text-xs text-slate-400">لا توجد جلسات بث ضمن هذا التصنيف.</p>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1915,30 +2476,93 @@ export function ModerationView({ onBack }: ModerationViewProps) {
         </div>
       )}
 
-      {/* 6. IMMUTABLE AUDIT LOGS */}
+      {/* 6. IMMUTABLE AUDIT LOGS (SEARCHABLE, FILTERABLE, 20 PER PAGE) */}
       {activeTab === 'logs' && canLogs && (
-        <div className="space-y-2">
-          {auditLogs.map((log) => (
-            <div
-              key={log.id}
-              className="p-3 bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] rounded-xl text-xs space-y-1"
-            >
-              <div className="flex items-center justify-between text-slate-500">
-                <span className="font-bold text-[#3B6DFF] dark:text-[#4F8CFF]">
-                  {log.actorName} ({log.actorRole})
-                </span>
-                <span className="text-[10px]">{formatRelativeTime(log.createdAt)}</span>
-              </div>
-              <p className="text-slate-900 dark:text-white font-medium">
-                {log.targetDetails || log.actionType}
-              </p>
+        <div className="space-y-3">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <div className="relative sm:col-span-2">
+              <input
+                type="text"
+                value={logSearch}
+                onChange={(e) => {
+                  setLogSearch(e.target.value);
+                  setLogPage(1);
+                }}
+                placeholder="ابحث باسم المنفذ أو التفاصيل..."
+                className="w-full bg-[#111827] border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-[#D4AF37]"
+              />
+              <Search className="absolute end-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
             </div>
-          ))}
 
-          {auditLogs.length === 0 && (
-            <div className="py-12 text-center bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] rounded-2xl p-6">
+            <select
+              value={logActionFilter}
+              onChange={(e) => {
+                setLogActionFilter(e.target.value);
+                setLogPage(1);
+              }}
+              className="bg-[#111827] border border-slate-800 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+            >
+              <option value="all">كل الإجراءات ({auditLogs.length})</option>
+              {Array.from(new Set(auditLogs.map((l) => l.actionType))).map((typeKey) => (
+                <option key={typeKey} value={typeKey}>
+                  {AUDIT_ACTION_LABELS[typeKey] || typeKey}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-2">
+            {paginatedLogs.map((log) => (
+              <div
+                key={log.id}
+                className="p-3 bg-[#111827] border border-slate-800 rounded-xl text-xs space-y-1"
+              >
+                <div className="flex items-center justify-between gap-2 text-slate-400">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="font-bold text-[#D4AF37] truncate">
+                      {log.actorName} ({log.actorRole})
+                    </span>
+                    <span className="px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 text-[10px] font-bold shrink-0">
+                      {AUDIT_ACTION_LABELS[log.actionType] || log.actionType}
+                    </span>
+                  </div>
+                  <span className="text-[10px] shrink-0">{formatRelativeTime(log.createdAt)}</span>
+                </div>
+                <p className="text-slate-100 font-medium leading-relaxed">
+                  {log.targetDetails || log.actionType}
+                </p>
+              </div>
+            ))}
+          </div>
+
+          {filteredLogs.length === 0 ? (
+            <div className="py-12 text-center bg-[#111827] border border-slate-800 rounded-2xl p-6">
               <FileText className="w-8 h-8 text-slate-400 mx-auto mb-2" />
-              <p className="text-xs text-slate-500 dark:text-slate-400">لا توجد سجلات بعد.</p>
+              <p className="text-xs text-slate-400">لا توجد سجلات مطابقة.</p>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between pt-2">
+              <button
+                type="button"
+                disabled={safeLogPage <= 1}
+                onClick={() => setLogPage((p) => Math.max(1, p - 1))}
+                className="min-h-[40px] px-3 py-1.5 rounded-xl bg-[#111827] border border-slate-800 text-xs font-bold text-slate-200 flex items-center gap-1 disabled:opacity-40 cursor-pointer"
+              >
+                <ChevronRight className="w-4 h-4" />
+                <span>السابق</span>
+              </button>
+              <span className="text-xs text-slate-400 tabular-nums">
+                صفحة {safeLogPage} من {totalLogPages} • ({filteredLogs.length} سجل)
+              </span>
+              <button
+                type="button"
+                disabled={safeLogPage >= totalLogPages}
+                onClick={() => setLogPage((p) => Math.min(totalLogPages, p + 1))}
+                className="min-h-[40px] px-3 py-1.5 rounded-xl bg-[#111827] border border-slate-800 text-xs font-bold text-slate-200 flex items-center gap-1 disabled:opacity-40 cursor-pointer"
+              >
+                <span>التالي</span>
+                <ChevronLeft className="w-4 h-4" />
+              </button>
             </div>
           )}
         </div>
@@ -2108,6 +2732,214 @@ export function ModerationView({ onBack }: ModerationViewProps) {
                 onClick={() => setConfirmDeleteReportPost(null)}
                 disabled={submittingModal}
                 className="px-4 py-2 rounded-xl border border-slate-200 dark:border-[#2A2F3A] text-slate-700 dark:text-slate-300 text-xs font-bold"
+              >
+                إلغاء
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* XP Adjustment Modal */}
+      {xpModalUser && (
+        <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-sm bg-[#111827] border border-[#D4AF37]/35 rounded-3xl p-5 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-bold text-white">
+                تعديل نقاط الخبرة (@{xpModalUser.handle})
+              </h4>
+              <button
+                type="button"
+                onClick={() => setXpModalUser(null)}
+                className="p-1.5 rounded-xl text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="text-xs text-slate-300 bg-[#0B1120] border border-slate-800 rounded-xl p-3 tabular-nums">
+              الرصيد الحالي: <strong className="text-[#D4AF37]">{xpModalUser.xp || 0} XP</strong> • المستوى{' '}
+              <strong>{xpModalUser.level || computeLevelFromXp(xpModalUser.xp || 0)}</strong>
+            </div>
+            <div className="space-y-2">
+              <label className="text-[11px] text-slate-400 block">
+                مقدار التعديل (قيمة موجبة للإضافة أو سالبة للخصم)
+              </label>
+              <input
+                type="number"
+                value={xpDeltaInput}
+                onChange={(e) => setXpDeltaInput(e.target.value)}
+                className="w-full bg-[#0B1120] border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+              />
+            </div>
+            <textarea
+              value={xpReasonInput}
+              onChange={(e) => setXpReasonInput(e.target.value)}
+              rows={2}
+              placeholder="سبب التعديل (مثلاً: مكافأة فعالية، تصحيح إداري)..."
+              className="w-full bg-[#0B1120] border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-[#D4AF37] resize-none"
+            />
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void submitXpAdjustment()}
+                disabled={submittingModal}
+                className="flex-1 min-h-[42px] py-2 rounded-xl bg-[#D4AF37] hover:bg-amber-400 text-[#0B1120] text-xs font-extrabold flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
+              >
+                {submittingModal && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>اعتماد التعديل</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setXpModalUser(null)}
+                disabled={submittingModal}
+                className="min-h-[42px] px-4 py-2 rounded-xl border border-slate-700 text-slate-300 text-xs font-bold cursor-pointer"
+              >
+                إلغاء
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sticker Pack Reject / Delete Modal */}
+      {stickerActionModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-sm bg-[#111827] border border-slate-800 rounded-3xl p-5 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-bold text-white">
+                {stickerActionModal.action === 'reject'
+                  ? `رفض حزمة "${stickerActionModal.pack.title}"`
+                  : `حذف حزمة "${stickerActionModal.pack.title}" نهائياً`}
+              </h4>
+              <button
+                type="button"
+                onClick={() => setStickerActionModal(null)}
+                className="p-1.5 rounded-xl text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <textarea
+              value={stickerActionNote}
+              onChange={(e) => setStickerActionNote(e.target.value)}
+              rows={3}
+              placeholder={
+                stickerActionModal.action === 'reject'
+                  ? 'سبب الرفض (سيظهر لمنشئ الحزمة)...'
+                  : 'سبب الحذف الإداري (اختياري)...'
+              }
+              className="w-full bg-[#0B1120] border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-[#D4AF37] resize-none"
+            />
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void submitStickerActionModal()}
+                disabled={submittingModal}
+                className="flex-1 min-h-[42px] py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
+              >
+                {submittingModal && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>{stickerActionModal.action === 'reject' ? 'تأكيد الرفض' : 'حذف نهائي'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setStickerActionModal(null)}
+                disabled={submittingModal}
+                className="min-h-[42px] px-4 py-2 rounded-xl border border-slate-700 text-slate-300 text-xs font-bold cursor-pointer"
+              >
+                إلغاء
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Room Delete Modal */}
+      {roomDeleteModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-sm bg-[#111827] border border-rose-500/35 rounded-3xl p-5 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-bold text-rose-400">
+                حذف غرفة "{roomDeleteModal.title}"
+              </h4>
+              <button
+                type="button"
+                onClick={() => setRoomDeleteModal(null)}
+                className="p-1.5 rounded-xl text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              سيتم حذف الغرفة وسجلاتها ورسائلها نهائياً وتوثيق الإجراء في سجل الرقابة.
+            </p>
+            <textarea
+              value={roomDeleteReason}
+              onChange={(e) => setRoomDeleteReason(e.target.value)}
+              rows={2}
+              placeholder="سبب الحذف (اختياري)..."
+              className="w-full bg-[#0B1120] border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-[#D4AF37] resize-none"
+            />
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void submitDeleteRoomModal()}
+                disabled={submittingModal}
+                className="flex-1 min-h-[42px] py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
+              >
+                {submittingModal && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>تأكيد حذف الغرفة</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setRoomDeleteModal(null)}
+                disabled={submittingModal}
+                className="min-h-[42px] px-4 py-2 rounded-xl border border-slate-700 text-slate-300 text-xs font-bold cursor-pointer"
+              >
+                إلغاء
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Force End Live Broadcast Modal */}
+      {endLiveModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-sm bg-[#111827] border border-rose-500/35 rounded-3xl p-5 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-bold text-rose-400">
+                إنهاء البث المباشر "{endLiveModal.title}"
+              </h4>
+              <button
+                type="button"
+                onClick={() => setEndLiveModal(null)}
+                className="p-1.5 rounded-xl text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <textarea
+              value={endLiveReason}
+              onChange={(e) => setEndLiveReason(e.target.value)}
+              rows={2}
+              placeholder="سبب إنهاء البث إدارياً (اختياري)..."
+              className="w-full bg-[#0B1120] border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-[#D4AF37] resize-none"
+            />
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void submitEndLiveModal()}
+                disabled={submittingModal}
+                className="flex-1 min-h-[42px] py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
+              >
+                {submittingModal && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>إنهاء البث الآن</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setEndLiveModal(null)}
+                disabled={submittingModal}
+                className="min-h-[42px] px-4 py-2 rounded-xl border border-slate-700 text-slate-300 text-xs font-bold cursor-pointer"
               >
                 إلغاء
               </button>

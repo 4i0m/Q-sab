@@ -69,7 +69,9 @@ export function BottomNav({
           <div className="relative">
             <MessageSquare className="w-5 h-5 stroke-[2.2]" />
             {unreadMessagesCount > 0 && (
-              <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-[#3B6DFF]" />
+              <span className="absolute -top-1.5 -end-2.5 min-w-[16px] h-[16px] px-1 rounded-full bg-[#3B6DFF] text-white text-[9px] font-bold flex items-center justify-center tabular-nums shadow-sm">
+                {unreadMessagesCount > 99 ? '99+' : unreadMessagesCount}
+              </span>
             )}
           </div>
           <span className="text-[10px] font-ar tracking-tight whitespace-nowrap">{t('messages')}</span>

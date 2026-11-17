@@ -29,7 +29,8 @@ import {
   Camera,
   MessagesSquare,
   Edit3,
-  Flag
+  Flag,
+  Palette
 } from 'lucide-react';
 import {
   Conversation,
@@ -38,6 +39,7 @@ import {
 } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
+import { useTheme } from '../../context/ThemeContext';
 import {
   listenToConversations,
   listenToMessages,
@@ -53,7 +55,8 @@ import {
   createGroupConversation,
   addGroupConversationMembers,
   leaveGroupConversation,
-  checkIsFollowing
+  checkIsFollowing,
+  updateUserProfileCustomization
 } from '../../services/firestore';
 import {
   uploadMediaWithControl,
@@ -65,7 +68,12 @@ import {
 import { useToast } from '../../context/ToastContext';
 import { VerifiedBadge } from '../common/VerifiedBadge';
 import { MediaImage } from '../common/MediaImage';
+import { StickerDrawer, SelectedStickerPayload } from '../chat/StickerDrawer';
+import { ChatBackgroundPicker } from '../chat/ChatBackgroundPicker';
+import { resolveChatBackgroundStyle } from '../../utils/chatBackgrounds';
 import { formatRelativeTime } from '../../utils/date';
+import { useLiveUserProfiles } from '../../hooks/useUserProfiles';
+import { matchesSearchQuery } from '../../utils/search';
 
 interface MessagesViewProps {
   initialConversationId?: string | null;
@@ -115,6 +123,7 @@ export function MessagesView({
 }: MessagesViewProps) {
   const { currentUser, firebaseUser, isAdmin, onlineUsers } = useAuth();
   const { isRTL, t } = useLanguage();
+  const { resolvedTheme } = useTheme();
   const { showToast } = useToast();
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -140,6 +149,7 @@ export function MessagesView({
   // Composer extras
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showStickers, setShowStickers] = useState(false);
+  const [showBgPicker, setShowBgPicker] = useState(false);
   const [pendingMedia, setPendingMedia] = useState<{
     file: File;
     localUrl: string;
@@ -201,6 +211,60 @@ export function MessagesView({
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const onlineSet = useMemo(() => new Set(onlineUsers.map((u) => u.userId)), [onlineUsers]);
+
+  const trackedUserIds = useMemo(() => {
+    const ids: string[] = [];
+    conversations.forEach((conv) => {
+      (conv.participantIds || []).forEach((pid) => {
+        if (pid !== currentUser?.id) ids.push(pid);
+      });
+    });
+    messages.forEach((m) => {
+      if (m.senderId && m.senderId !== currentUser?.id) ids.push(m.senderId);
+    });
+    return ids;
+  }, [conversations, messages, currentUser?.id]);
+
+  const liveProfiles = useLiveUserProfiles(trackedUserIds);
+
+  const resolveConvParticipant = (conv: Conversation | undefined, uid?: string) => {
+    if (!uid) {
+      return {
+        displayName: 'مستخدم Q',
+        handle: 'member',
+        photoURL: '',
+        isVerified: false,
+        verificationCategory: 'blue' as const,
+      };
+    }
+    if (uid === currentUser?.id && currentUser) {
+      return {
+        displayName: currentUser.displayName,
+        handle: currentUser.handle,
+        photoURL: currentUser.photoURL || '',
+        isVerified: Boolean(currentUser.isVerified),
+        verificationCategory: currentUser.verificationCategory || ('blue' as const),
+      };
+    }
+    const live = liveProfiles[uid];
+    const snap = conv?.participantDetails?.[uid];
+    if (live) {
+      return {
+        displayName: live.displayName,
+        handle: live.handle,
+        photoURL: live.photoURL,
+        isVerified: live.isVerified,
+        verificationCategory: live.verificationCategory || ('blue' as const),
+      };
+    }
+    return {
+      displayName: snap?.displayName || 'مستخدم Q',
+      handle: snap?.handle || uid.slice(0, 8),
+      photoURL: snap?.photoURL || '',
+      isVerified: Boolean(snap?.isVerified),
+      verificationCategory: snap?.verificationCategory || ('blue' as const),
+    };
+  };
 
   const setConversationOpen = (convId: string | null) => {
     setActiveConvId(convId);
@@ -581,14 +645,16 @@ export function MessagesView({
     }
   };
 
-  const handleSendSticker = async (sticker: (typeof Q_STICKERS)[number]) => {
+  const handleSendSticker = async (sticker: SelectedStickerPayload) => {
     if (!currentUser || !activeConvId || sending) return;
     setShowStickers(false);
     try {
       setSending(true);
-      await sendMessage(activeConvId, currentUser, recipientId, sticker.emoji, undefined, {
+      await sendMessage(activeConvId, currentUser, recipientId, sticker.label || '', undefined, {
         messageType: 'sticker',
-        stickerId: sticker.id,
+        stickerId: sticker.stickerId,
+        stickerUrl: sticker.url,
+        stickerPackId: sticker.packId,
         recipientIds: sendRecipientIds,
         replyTo: replyingTo
           ? {
@@ -603,6 +669,63 @@ export function MessagesView({
       showToast('تعذر إرسال الملصق', 'error');
     } finally {
       setSending(false);
+    }
+  };
+
+  const handleApplyDmBackground = async (options: {
+    presetId: string;
+    bgImageURL: string;
+    scrimOpacity: number;
+    scope: 'conversation' | 'default_dm';
+  }) => {
+    if (!currentUser) return;
+    const prevCustom = currentUser.customization || {};
+    const prevChat = prevCustom.chatPreferences || {};
+    const nextChat = { ...prevChat };
+
+    if (options.scope === 'default_dm') {
+      nextChat.defaultDmBgPresetId = options.presetId;
+      nextChat.defaultDmBgImageURL = options.bgImageURL || '';
+    } else if (activeConvId) {
+      nextChat.dmBackgrounds = {
+        ...(prevChat.dmBackgrounds || {}),
+        [activeConvId]: {
+          presetId: options.presetId,
+          imageURL: options.bgImageURL || '',
+        },
+      };
+    }
+
+    try {
+      await updateUserProfileCustomization(currentUser.id, {
+        ...prevCustom,
+        chatPreferences: nextChat,
+      });
+      showToast('تم حفظ خلفية المحادثة بنجاح.', 'success');
+    } catch {
+      showToast('تعذر حفظ خلفية المحادثة.', 'error');
+    }
+  };
+
+  const handleResetDmBackground = async () => {
+    if (!currentUser) return;
+    const prevCustom = currentUser.customization || {};
+    const prevChat = prevCustom.chatPreferences || {};
+    const nextDmMap = { ...(prevChat.dmBackgrounds || {}) };
+    if (activeConvId) {
+      delete nextDmMap[activeConvId];
+    }
+    try {
+      await updateUserProfileCustomization(currentUser.id, {
+        ...prevCustom,
+        chatPreferences: {
+          ...prevChat,
+          dmBackgrounds: nextDmMap,
+        },
+      });
+      showToast('تمت استعادة الخلفية الافتراضية.', 'info');
+    } catch {
+      showToast('تعذر إعادة ضبط الخلفية.', 'error');
     }
   };
 
@@ -748,7 +871,9 @@ export function MessagesView({
   const BackArrow = isRTL ? ChevronRight : ChevronLeft;
 
   const otherParticipantId = !isGroupConv ? otherParticipantIds[0] : undefined;
-  const otherParticipant = otherParticipantId ? currentConv?.participantDetails?.[otherParticipantId] : undefined;
+  const otherParticipant = otherParticipantId
+    ? resolveConvParticipant(currentConv, otherParticipantId)
+    : undefined;
   const activeChatTitle = isGroupConv
     ? currentConv?.groupName || 'دردشة جماعية'
     : otherParticipant?.displayName || currentConv?.groupName || 'محادثة';
@@ -756,6 +881,7 @@ export function MessagesView({
     ? currentConv?.groupAvatar
     : otherParticipant?.photoURL || currentConv?.groupAvatar;
   const activeChatVerified = !isGroupConv && Boolean(otherParticipant?.isVerified);
+  const activeChatVerificationCategory = otherParticipant?.verificationCategory || 'blue';
   const onlineGroupCount = isGroupConv
     ? otherParticipantIds.filter((id) => onlineSet.has(id)).length
     : 0;
@@ -771,7 +897,7 @@ export function MessagesView({
   const isOtherTyping = typingParticipantIds.length > 0;
   const typingSubtitle = isGroupConv
     ? typingParticipantIds.length === 1
-      ? `${currentConv?.participantDetails?.[typingParticipantIds[0]]?.displayName || 'عضو'} يكتب الآن...`
+      ? `${resolveConvParticipant(currentConv, typingParticipantIds[0]).displayName} يكتب الآن...`
       : 'عدة أعضاء يكتبون الآن...'
     : 'يكتب الآن...';
 
@@ -783,18 +909,24 @@ export function MessagesView({
   // ============================================================================
   if (activeConvId) {
     const sharedMediaMessages = messages.filter((m) => Boolean(m.mediaURL) && !m.deletedAt);
-    const trimmedThreadSearch = threadSearch.trim().toLowerCase();
+    const trimmedThreadSearch = threadSearch.trim();
     const displayedMessages = trimmedThreadSearch
-      ? messages.filter((m) => (m.text || '').toLowerCase().includes(trimmedThreadSearch))
+      ? messages.filter((m) =>
+          matchesSearchQuery(
+            trimmedThreadSearch,
+            m.text,
+            liveProfiles[m.senderId]?.displayName || m.senderName
+          )
+        )
       : messages;
 
     const WAVEFORM_BARS = [38, 65, 92, 54, 78, 45, 96, 68, 84, 48, 74, 58, 88, 42];
     const groupParticipantCount = currentConv?.participantIds?.length || 0;
 
     return (
-      <div className="w-full h-[100dvh] lg:h-[calc(100vh-5.5rem)] lg:max-w-2xl lg:mx-auto flex flex-col bg-white dark:bg-[#0B0F19] lg:border lg:border-slate-200 lg:dark:border-[#2A2F3A] lg:rounded-3xl overflow-hidden shadow-xl font-ar">
+      <div className="fixed inset-0 z-40 lg:static lg:z-auto w-full h-[100dvh] lg:h-[calc(100vh-5.5rem)] lg:max-w-2xl lg:mx-auto flex flex-col bg-white dark:bg-[#0B0F19] lg:border lg:border-slate-200 lg:dark:border-[#2A2F3A] lg:rounded-3xl overflow-hidden shadow-xl font-ar">
         {/* Glassmorphic Conversation Header */}
-        <div className="shrink-0 bg-white/92 dark:bg-[#131824]/92 backdrop-blur-xl border-b border-slate-200/80 dark:border-[#2A2F3A]">
+        <div className="shrink-0 bg-white/92 dark:bg-[#131824]/92 backdrop-blur-xl border-b border-slate-200/80 dark:border-[#2A2F3A] pt-[max(0.5rem,env(safe-area-inset-top))] lg:pt-0">
           <div className="px-3 py-2.5 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 min-w-0">
               <button
@@ -840,8 +972,9 @@ export function MessagesView({
                     </h3>
                     {activeChatVerified && (
                       <VerifiedBadge
-                        category={otherParticipant?.verificationCategory || 'blue'}
+                        category={activeChatVerificationCategory}
                         className="w-3.5 h-3.5 shrink-0"
+                        interactive={false}
                       />
                     )}
                   </div>
@@ -866,7 +999,7 @@ export function MessagesView({
               </button>
             </div>
 
-            {/* Thread Utility Actions: Group Members / Search / Shared Media */}
+            {/* Thread Utility Actions: Group Members / Background / Search / Shared Media */}
             <div className="flex items-center gap-1 shrink-0">
               {isGroupConv && (
                 <button
@@ -883,6 +1016,15 @@ export function MessagesView({
                   <Users className="w-4 h-4" />
                 </button>
               )}
+              <button
+                type="button"
+                onClick={() => setShowBgPicker(true)}
+                className="min-w-[44px] min-h-[44px] rounded-xl flex items-center justify-center transition-colors cursor-pointer text-slate-500 dark:text-[#94A3B8] hover:bg-slate-100 dark:hover:bg-[#1E2536] hover:text-[#3B6DFF]"
+                aria-label="خلفية المحادثة"
+                title="خلفية المحادثة"
+              >
+                <Palette className="w-4 h-4" />
+              </button>
               <button
                 type="button"
                 onClick={() => setThreadToolsTab((prev) => (prev === 'search' ? null : 'search'))}
@@ -985,11 +1127,7 @@ export function MessagesView({
                   <div className="max-h-32 overflow-y-auto space-y-1">
                     {availableUsers
                       .filter((u) => !currentConv.participantIds.includes(u.id))
-                      .filter((u) => {
-                        if (!addMemberSearch.trim()) return true;
-                        const q = addMemberSearch.toLowerCase();
-                        return u.displayName.toLowerCase().includes(q) || u.handle.toLowerCase().includes(q);
-                      })
+                      .filter((u) => matchesSearchQuery(addMemberSearch, u.displayName, u.handle))
                       .map((u) => {
                         const checked = selectedAddMemberIds.includes(u.id);
                         return (
@@ -1035,7 +1173,7 @@ export function MessagesView({
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                 {currentConv.participantIds.map((pid) => {
-                  const detail = currentConv.participantDetails?.[pid];
+                  const detail = resolveConvParticipant(currentConv, pid);
                   const isMe = pid === currentUser?.id;
                   const online = onlineSet.has(pid);
                   return (
@@ -1051,10 +1189,10 @@ export function MessagesView({
                     >
                       <div className="relative shrink-0">
                         <MediaImage
-                          src={detail?.photoURL}
-                          alt={detail?.displayName || 'عضو'}
+                          src={detail.photoURL}
+                          alt={detail.displayName}
                           variant="avatar"
-                          fallbackText={detail?.displayName || 'Q'}
+                          fallbackText={detail.displayName}
                           containerClassName="w-7 h-7 rounded-full overflow-hidden"
                           className="w-full h-full object-cover"
                         />
@@ -1063,11 +1201,18 @@ export function MessagesView({
                         )}
                       </div>
                       <div className="min-w-0 flex-1">
-                        <span className="text-xs font-bold text-slate-900 dark:text-white truncate block">
-                          {detail?.displayName || 'عضو'} {isMe ? '(أنت)' : ''}
+                        <span className="text-xs font-bold text-slate-900 dark:text-white truncate flex items-center gap-1">
+                          <span className="truncate">{detail.displayName} {isMe ? '(أنت)' : ''}</span>
+                          {detail.isVerified && (
+                            <VerifiedBadge
+                              category={detail.verificationCategory}
+                              className="w-3 h-3 shrink-0"
+                              interactive={false}
+                            />
+                          )}
                         </span>
                         <span className="text-[11px] text-slate-500 dark:text-[#94A3B8] truncate block font-handle">
-                          @{detail?.handle || pid.slice(0, 8)}
+                          @{detail.handle}
                         </span>
                       </div>
                     </button>
@@ -1146,58 +1291,84 @@ export function MessagesView({
           )}
         </div>
 
-        {/* Messages Stream with Atmospheric Pattern */}
-        <div
-          onClick={() => setActiveActionMsgId(null)}
-          className="flex-1 overflow-y-auto px-3 sm:px-4 py-4 space-y-1.5 chat-canvas-pattern"
-        >
-          {loadingMessages ? (
-            <div className="py-12 flex justify-center">
-              <Loader2 className="w-6 h-6 animate-spin text-[#3B6DFF]" />
-            </div>
-          ) : displayedMessages.length > 0 ? (
-            displayedMessages.map((msg, index) => {
-              const isMine = msg.senderId === currentUser?.id;
-              const prevMsg = index > 0 ? displayedMessages[index - 1] : null;
-              const nextMsg = index < displayedMessages.length - 1 ? displayedMessages[index + 1] : null;
-              const showDateDivider =
-                !prevMsg || getDateGroupLabel(prevMsg.createdAt) !== getDateGroupLabel(msg.createdAt);
-              const isGroupedPrev =
-                Boolean(prevMsg && prevMsg.senderId === msg.senderId && !showDateDivider);
-              const isGroupedNext =
-                Boolean(
-                  nextMsg &&
-                    nextMsg.senderId === msg.senderId &&
-                    getDateGroupLabel(nextMsg.createdAt) === getDateGroupLabel(msg.createdAt)
-                );
-              const isSeen =
-                isMine &&
-                msg.id === lastMyMessageId &&
-                otherParticipantIds.some((id) => {
-                  const r = currentConv?.readBy?.[id];
-                  return Boolean(r && r >= msg.createdAt);
-                });
-              const stickerObj =
-                msg.messageType === 'sticker'
-                  ? Q_STICKERS.find((s) => s.id === msg.stickerId)
-                  : undefined;
-              const reactionsEntries = Object.entries(msg.reactions || {}).filter(
-                ([, users]) => users.length > 0
-              );
-              const voicePct = audioProgress[msg.id] || 0;
-              const isVoicePlaying = playingAudioId === msg.id;
+        {/* Messages Stream with Atmospheric Pattern or Custom Background */}
+        {(() => {
+          const chatPrefs = currentUser?.customization?.chatPreferences;
+          const perConvBg = activeConvId ? chatPrefs?.dmBackgrounds?.[activeConvId] : undefined;
+          const dmPresetId = perConvBg?.presetId || chatPrefs?.defaultDmBgPresetId || 'default';
+          const dmImageURL = perConvBg
+            ? perConvBg.imageURL || ''
+            : chatPrefs?.defaultDmBgImageURL || '';
+          const dmBgResolved = resolveChatBackgroundStyle({
+            presetId: dmPresetId,
+            bgImageURL: dmImageURL,
+            resolvedTheme,
+          });
+          const dmCanvasStyle = dmBgResolved.hasCustomImage
+            ? {
+                ...dmBgResolved.style,
+                backgroundImage: `linear-gradient(rgba(9,13,22,0.52), rgba(9,13,22,0.62)), ${dmBgResolved.style.backgroundImage}`,
+              }
+            : dmBgResolved.style;
+          const usePattern = dmPresetId === 'default' && !dmImageURL;
 
-              const bubbleShape = stickerObj
-                ? 'bg-transparent shadow-none p-1'
-                : msg.deletedAt
-                ? 'bg-white/75 dark:bg-[#161B26]/70 border border-slate-200 dark:border-[#2A2F3A] text-slate-400 italic rounded-[20px]'
-                : isMine
-                ? `bg-gradient-to-br from-[#3B6DFF] to-[#2554E8] text-white shadow-[0_6px_18px_rgba(59,109,255,0.22)] rounded-[20px] ${
-                    !isGroupedNext ? 'rounded-ee-[6px]' : ''
-                  }`
-                : `bg-white dark:bg-[#161B26] border border-slate-200/90 dark:border-[#2A2F3A] text-slate-900 dark:text-[#F8FAFC] shadow-sm rounded-[20px] ${
-                    !isGroupedNext ? 'rounded-es-[6px]' : ''
-                  }`;
+          return (
+            <div
+              onClick={() => setActiveActionMsgId(null)}
+              style={dmCanvasStyle}
+              className={`flex-1 overflow-y-auto overflow-x-hidden px-3 sm:px-4 py-4 space-y-1.5 ${
+                usePattern ? 'chat-canvas-pattern' : ''
+              }`}
+            >
+              {loadingMessages ? (
+                <div className="py-12 flex justify-center">
+                  <Loader2 className="w-6 h-6 animate-spin text-[#3B6DFF]" />
+                </div>
+              ) : displayedMessages.length > 0 ? (
+                displayedMessages.map((msg, index) => {
+                  const isMine = msg.senderId === currentUser?.id;
+                  const prevMsg = index > 0 ? displayedMessages[index - 1] : null;
+                  const nextMsg = index < displayedMessages.length - 1 ? displayedMessages[index + 1] : null;
+                  const showDateDivider =
+                    !prevMsg || getDateGroupLabel(prevMsg.createdAt) !== getDateGroupLabel(msg.createdAt);
+                  const isGroupedPrev =
+                    Boolean(prevMsg && prevMsg.senderId === msg.senderId && !showDateDivider);
+                  const isGroupedNext =
+                    Boolean(
+                      nextMsg &&
+                        nextMsg.senderId === msg.senderId &&
+                        getDateGroupLabel(nextMsg.createdAt) === getDateGroupLabel(msg.createdAt)
+                    );
+                  const isSeen =
+                    isMine &&
+                    msg.id === lastMyMessageId &&
+                    otherParticipantIds.some((id) => {
+                      const r = currentConv?.readBy?.[id];
+                      return Boolean(r && r >= msg.createdAt);
+                    });
+                  const stickerObj =
+                    msg.messageType === 'sticker'
+                      ? Q_STICKERS.find((s) => s.id === msg.stickerId)
+                      : undefined;
+                  const hasCustomSticker = Boolean(msg.messageType === 'sticker' && msg.stickerUrl);
+                  const isStickerMsg = Boolean(hasCustomSticker || stickerObj);
+                  const reactionsEntries = Object.entries(msg.reactions || {}).filter(
+                    ([, users]) => users.length > 0
+                  );
+                  const voicePct = audioProgress[msg.id] || 0;
+                  const isVoicePlaying = playingAudioId === msg.id;
+
+                  const bubbleShape = isStickerMsg
+                    ? 'bg-transparent shadow-none p-1'
+                    : msg.deletedAt
+                    ? 'bg-white/75 dark:bg-[#161B26]/70 border border-slate-200 dark:border-[#2A2F3A] text-slate-400 italic rounded-[20px]'
+                    : isMine
+                    ? `bg-gradient-to-br from-[#3B6DFF] to-[#2554E8] text-white shadow-[0_6px_18px_rgba(59,109,255,0.22)] rounded-[20px] ${
+                        !isGroupedNext ? 'rounded-ee-[6px]' : ''
+                      }`
+                    : `bg-white dark:bg-[#161B26] border border-slate-200/90 dark:border-[#2A2F3A] text-slate-900 dark:text-[#F8FAFC] shadow-sm rounded-[20px] ${
+                        !isGroupedNext ? 'rounded-es-[6px]' : ''
+                      }`;
 
               return (
                 <React.Fragment key={msg.id}>
@@ -1219,23 +1390,37 @@ export function MessagesView({
                     {!isMine && (
                       <div className="w-7 h-7 shrink-0">
                         {!isGroupedNext && (
-                          <MediaImage
-                            src={msg.senderPhotoURL || activeChatAvatar}
-                            alt={msg.senderName}
-                            variant="avatar"
-                            fallbackText={msg.senderName}
-                            containerClassName="w-7 h-7 rounded-full border border-slate-200 dark:border-[#2A2F3A] overflow-hidden shadow-xs"
-                            className="w-full h-full object-cover"
-                          />
+                          <button
+                            type="button"
+                            onClick={() => msg.senderId && onSelectUserForProfile?.(msg.senderId)}
+                            className="w-7 h-7 rounded-full block cursor-pointer"
+                          >
+                            <MediaImage
+                              src={
+                                liveProfiles[msg.senderId]
+                                  ? liveProfiles[msg.senderId].photoURL
+                                  : msg.senderPhotoURL || activeChatAvatar
+                              }
+                              alt={liveProfiles[msg.senderId]?.displayName || msg.senderName}
+                              variant="avatar"
+                              fallbackText={liveProfiles[msg.senderId]?.displayName || msg.senderName}
+                              containerClassName="w-7 h-7 rounded-full border border-slate-200 dark:border-[#2A2F3A] overflow-hidden shadow-xs"
+                              className="w-full h-full object-cover"
+                            />
+                          </button>
                         )}
                       </div>
                     )}
 
-                    <div className={`max-w-[80%] sm:max-w-[74%] flex flex-col ${isMine ? 'items-end' : 'items-start'}`}>
+                    <div className={`max-w-[80%] sm:max-w-[74%] min-w-0 flex flex-col ${isMine ? 'items-end' : 'items-start'}`}>
                       {!isMine && isGroupConv && !isGroupedPrev && (
-                        <span className="text-[11px] font-bold text-[#3B6DFF] dark:text-[#60A5FA] mb-1 px-1.5">
-                          {msg.senderName}
-                        </span>
+                        <button
+                          type="button"
+                          onClick={() => msg.senderId && onSelectUserForProfile?.(msg.senderId)}
+                          className="text-[11px] font-bold text-[#3B6DFF] dark:text-[#60A5FA] mb-1 px-1.5 truncate max-w-full hover:underline cursor-pointer"
+                        >
+                          {liveProfiles[msg.senderId]?.displayName || msg.senderName}
+                        </button>
                       )}
                       <div
                         onClick={(e) => {
@@ -1261,7 +1446,7 @@ export function MessagesView({
                             setActionSheetMsg(msg);
                           }
                         }}
-                        className={`relative px-3.5 py-2.5 text-[13.5px] leading-relaxed cursor-pointer transition-transform active:scale-[0.99] ${bubbleShape}`}
+                        className={`relative max-w-full min-w-0 px-3.5 py-2.5 text-[13.5px] leading-relaxed cursor-pointer transition-transform active:scale-[0.99] ${bubbleShape}`}
                       >
                         {msg.deletedAt ? (
                           <span>تم حذف هذه الرسالة</span>
@@ -1285,7 +1470,15 @@ export function MessagesView({
                             )}
 
                             {/* Sticker Bubble */}
-                            {stickerObj && (
+                            {hasCustomSticker && msg.stickerUrl ? (
+                              <MediaImage
+                                src={msg.stickerUrl}
+                                alt={msg.text || 'ملصق'}
+                                variant="thumbnail"
+                                containerClassName="w-28 h-28 overflow-hidden rounded-2xl"
+                                className="w-full h-full object-contain drop-shadow-md"
+                              />
+                            ) : stickerObj ? (
                               <div
                                 className={`w-24 h-24 rounded-3xl bg-gradient-to-br ${stickerObj.bg} flex flex-col items-center justify-center shadow-lg`}
                               >
@@ -1294,25 +1487,25 @@ export function MessagesView({
                                   {stickerObj.label}
                                 </span>
                               </div>
-                            )}
+                            ) : null}
 
                             {/* Image / Video Media Bubble */}
                             {msg.mediaURL && (
-                              <div className="mb-1.5 rounded-2xl overflow-hidden bg-slate-900/10 dark:bg-black/20">
+                              <div className="mb-1.5 w-full max-w-[260px] min-w-0 rounded-2xl overflow-hidden bg-slate-900/10 dark:bg-black/20">
                                 {msg.mediaType === 'video' ||
                                 /\.(mp4|webm|mov|m4v)(\?|$)/i.test(msg.mediaURL) ? (
                                   <video
                                     src={msg.mediaURL}
                                     controls
                                     playsInline
-                                    className="max-w-full max-h-64 rounded-2xl"
+                                    className="w-full max-w-full max-h-64 rounded-2xl"
                                   />
                                 ) : (
                                   <MediaImage
                                     src={msg.mediaURL}
                                     alt="صورة مرسلة"
                                     variant="chat"
-                                    containerClassName="max-w-full min-w-[160px] max-h-72 rounded-2xl overflow-hidden cursor-pointer"
+                                    containerClassName="w-full max-w-[260px] min-w-0 max-h-72 rounded-2xl overflow-hidden cursor-pointer"
                                     className="w-full max-h-72 object-cover rounded-2xl"
                                     onClick={(ev) => {
                                       ev.stopPropagation();
@@ -1325,7 +1518,7 @@ export function MessagesView({
 
                             {/* Interactive Multi-Bar Waveform Voice Bubble */}
                             {msg.audioURL && (
-                              <div className="flex items-center gap-3 min-w-[205px] py-1">
+                              <div className="flex items-center gap-3 w-[220px] max-w-full min-w-0 py-1">
                                 <button
                                   type="button"
                                   onClick={(ev) => {
@@ -1379,8 +1572,8 @@ export function MessagesView({
                             )}
 
                             {/* Text */}
-                            {!stickerObj && msg.text && (
-                              <p className="whitespace-pre-line text-start break-words leading-relaxed">
+                            {!isStickerMsg && msg.text && (
+                              <p className="whitespace-pre-line text-start break-words [overflow-wrap:anywhere] leading-relaxed">
                                 {msg.text}
                               </p>
                             )}
@@ -1388,7 +1581,7 @@ export function MessagesView({
                             {/* Timestamp + Read Receipt */}
                             <div
                               className={`text-[9.5px] mt-1 flex items-center justify-end gap-1 tabular-nums ${
-                                stickerObj
+                                isStickerMsg
                                   ? 'text-slate-500 dark:text-[#94A3B8]'
                                   : isMine
                                   ? 'text-white/80'
@@ -1546,7 +1739,7 @@ export function MessagesView({
                 <h4 className="text-sm font-extrabold text-slate-900 dark:text-white flex items-center justify-center gap-1">
                   <span>{activeChatTitle}</span>
                   {activeChatVerified && (
-                    <VerifiedBadge category={otherParticipant?.verificationCategory || 'blue'} className="w-3.5 h-3.5" />
+                    <VerifiedBadge category={activeChatVerificationCategory} className="w-3.5 h-3.5" />
                   )}
                 </h4>
                 <p className="text-xs text-slate-500 dark:text-[#94A3B8] mt-1 leading-relaxed">
@@ -1584,6 +1777,8 @@ export function MessagesView({
 
           <div ref={messagesEndRef} />
         </div>
+          );
+        })()}
 
         {/* Pending Media Preview / Voice Recording / Reply Banner */}
         <div className="shrink-0 bg-white/95 dark:bg-[#131824]/95 backdrop-blur-xl border-t border-slate-200/80 dark:border-[#2A2F3A] pb-[env(safe-area-inset-bottom)]">
@@ -1697,22 +1892,12 @@ export function MessagesView({
             </div>
           )}
 
-          {/* Stickers Drawer */}
-          {showStickers && (
-            <div className="p-3 border-b border-slate-100 dark:border-[#2A2F3A] grid grid-cols-3 sm:grid-cols-6 gap-2 bg-slate-50 dark:bg-[#0B0F19]">
-              {Q_STICKERS.map((st) => (
-                <button
-                  key={st.id}
-                  type="button"
-                  onClick={() => handleSendSticker(st)}
-                  className={`p-2 rounded-2xl bg-gradient-to-br ${st.bg} text-white flex flex-col items-center justify-center gap-0.5 cursor-pointer hover:scale-105 transition-transform`}
-                >
-                  <span className="text-2xl">{st.emoji}</span>
-                  <span className="text-[10px] font-bold">{st.label}</span>
-                </button>
-              ))}
-            </div>
-          )}
+          {/* Real Sticker Drawer */}
+          <StickerDrawer
+            isOpen={showStickers}
+            onClose={() => setShowStickers(false)}
+            onSelectSticker={handleSendSticker}
+          />
 
           {/* Composer Bar */}
           <form onSubmit={handleSendTextMessage} className="p-2.5 flex items-center gap-1.5">
@@ -1766,15 +1951,15 @@ export function MessagesView({
             </button>
 
             {isRecording ? (
-              <div className="flex-1 min-h-[42px] px-3 rounded-2xl bg-red-500/10 border border-red-500/30 flex items-center justify-between text-xs text-red-600 dark:text-red-400 font-bold">
-                <span className="flex items-center gap-2">
-                  <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-ping" />
+              <div className="flex-1 min-w-0 min-h-[42px] px-3 rounded-2xl bg-red-500/10 border border-red-500/30 flex items-center justify-between text-xs text-red-600 dark:text-red-400 font-bold">
+                <span className="flex items-center gap-2 min-w-0 truncate">
+                  <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-ping shrink-0" />
                   <span>جاري التسجيل {formatDuration(recordSeconds)}</span>
                 </span>
                 <button
                   type="button"
                   onClick={stopVoiceRecording}
-                  className="px-3 py-1 rounded-xl bg-red-600 text-white text-[11px] flex items-center gap-1 cursor-pointer"
+                  className="px-3 py-1 rounded-xl bg-red-600 text-white text-[11px] flex items-center gap-1 cursor-pointer shrink-0"
                 >
                   <Square className="w-3 h-3 fill-current" />
                   <span>إيقاف</span>
@@ -1786,7 +1971,7 @@ export function MessagesView({
                 value={messageText}
                 onChange={(e) => handleTypingChange(e.target.value)}
                 placeholder="اكتب رسالتك هنا..."
-                className="flex-1 min-h-[42px] bg-slate-100 dark:bg-[#0B0F19] border border-slate-200 dark:border-[#2A2F3A] focus:border-[#3B6DFF] rounded-2xl px-3.5 text-xs text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-[#64748B] focus:outline-none transition-colors"
+                className="flex-1 min-w-0 min-h-[42px] bg-slate-100 dark:bg-[#0B0F19] border border-slate-200 dark:border-[#2A2F3A] focus:border-[#3B6DFF] rounded-2xl px-3.5 text-xs text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-[#64748B] focus:outline-none transition-colors"
               />
             )}
 
@@ -1820,6 +2005,27 @@ export function MessagesView({
             )}
           </form>
         </div>
+
+        {/* Chat Background Picker Modal */}
+        <ChatBackgroundPicker
+          isOpen={showBgPicker}
+          onClose={() => setShowBgPicker(false)}
+          title="تخصيص خلفية المحادثة"
+          currentPresetId={
+            (activeConvId && currentUser?.customization?.chatPreferences?.dmBackgrounds?.[activeConvId]?.presetId) ||
+            currentUser?.customization?.chatPreferences?.defaultDmBgPresetId ||
+            'default'
+          }
+          currentImageURL={
+            activeConvId && currentUser?.customization?.chatPreferences?.dmBackgrounds?.[activeConvId]
+              ? currentUser.customization.chatPreferences.dmBackgrounds[activeConvId]?.imageURL || ''
+              : currentUser?.customization?.chatPreferences?.defaultDmBgImageURL || ''
+          }
+          allowScopeChoice
+          uploadFolder="chats"
+          onApply={handleApplyDmBackground}
+          onResetToDefault={handleResetDmBackground}
+        />
 
         {/* Lightbox for Chat Images */}
         {lightboxUrl && (
@@ -2030,14 +2236,20 @@ export function MessagesView({
     })
     .filter((c) => {
       if (!searchQuery.trim()) return true;
-      const query = searchQuery.toLowerCase();
-      const otherId = c.participantIds.find((id) => id !== currentUser?.id);
-      const name = c.isGroup
-        ? c.groupName || ''
-        : otherId
-        ? c.participantDetails?.[otherId]?.displayName || ''
-        : c.groupName || '';
-      return name.toLowerCase().includes(query) || (c.lastMessageText || '').toLowerCase().includes(query);
+      const participantFields: Array<string | undefined> = [];
+      (c.participantIds || []).forEach((pid) => {
+        if (pid === currentUser?.id) return;
+        const live = liveProfiles[pid];
+        const snap = c.participantDetails?.[pid];
+        participantFields.push(live?.displayName, live?.handle, snap?.displayName, snap?.handle);
+      });
+      return matchesSearchQuery(
+        searchQuery,
+        c.groupName,
+        c.groupDescription,
+        c.lastMessageText,
+        ...participantFields
+      );
     });
 
   return (
@@ -2227,7 +2439,7 @@ export function MessagesView({
         ) : filteredConversations.length > 0 ? (
           filteredConversations.map((conv) => {
             const otherId = conv.participantIds.find((id) => id !== currentUser?.id);
-            const otherDetail = otherId ? conv.participantDetails?.[otherId] : undefined;
+            const otherDetail = otherId ? resolveConvParticipant(conv, otherId) : undefined;
             const title = conv.isGroup
               ? conv.groupName || 'دردشة جماعية'
               : otherDetail?.displayName || conv.groupName || 'محادثة';
@@ -2270,7 +2482,12 @@ export function MessagesView({
                       <span className="text-xs font-bold text-slate-900 dark:text-white truncate">
                         {title}
                       </span>
-                      {isVerified && <VerifiedBadge className="w-3 h-3" />}
+                      {isVerified && (
+                        <VerifiedBadge
+                          category={otherDetail?.verificationCategory || 'blue'}
+                          className="w-3 h-3"
+                        />
+                      )}
                     </div>
                     <p
                       className={`text-[11px] truncate mt-0.5 ${
@@ -2355,11 +2572,7 @@ export function MessagesView({
                 </div>
               ) : (
                 availableUsers
-                  .filter((u) => {
-                    if (!userSearchText.trim()) return true;
-                    const q = userSearchText.toLowerCase();
-                    return u.displayName.toLowerCase().includes(q) || u.handle.toLowerCase().includes(q);
-                  })
+                  .filter((u) => matchesSearchQuery(userSearchText, u.displayName, u.handle))
                   .map((u) => (
                     <button
                       key={u.id}
@@ -2383,7 +2596,7 @@ export function MessagesView({
                         <div>
                           <div className="flex items-center gap-1">
                             <span className="text-xs font-bold text-slate-900 dark:text-white">{u.displayName}</span>
-                            {u.isVerified && <VerifiedBadge className="w-3 h-3" />}
+                            {u.isVerified && <VerifiedBadge className="w-3 h-3" interactive={false} />}
                           </div>
                           <span className="text-[11px] text-slate-500 dark:text-[#94A3B8] font-handle">@{u.handle}</span>
                         </div>
@@ -2481,11 +2694,7 @@ export function MessagesView({
                   </div>
                 ) : (
                   availableUsers
-                    .filter((u) => {
-                      if (!groupMemberSearch.trim()) return true;
-                      const q = groupMemberSearch.toLowerCase();
-                      return u.displayName.toLowerCase().includes(q) || u.handle.toLowerCase().includes(q);
-                    })
+                    .filter((u) => matchesSearchQuery(groupMemberSearch, u.displayName, u.handle))
                     .map((u) => {
                       const selected = selectedGroupMemberIds.includes(u.id);
                       return (

@@ -33,6 +33,13 @@
         "customRoleId": { "type": "string", "description": "Assigned global custom role ID" },
         "customRoleName": { "type": "string", "description": "Assigned global custom role display name" },
         "globalPermissions": { "type": "object", "description": "Granular global permissions map" },
+        "level": { "type": "number", "description": "Current user level" },
+        "xp": { "type": "number", "description": "Total user XP" },
+        "dailyXpDate": { "type": "string", "description": "Server UTC date YYYY-MM-DD for daily XP cap" },
+        "dailyXpEarned": { "type": "number", "description": "Server-verified XP earned on dailyXpDate" },
+        "lastDailyCheckinDate": { "type": "string", "description": "Last server UTC date of daily check-in" },
+        "lastDailyCheckinAt": { "type": "string", "description": "ISO timestamp of last daily check-in" },
+        "xpActionLastAt": { "type": "object", "description": "Server-recorded last award ISO timestamps per XP action" },
         "createdAt": { "type": "string", "description": "Account creation timestamp" }
       },
       "required": ["id", "displayName", "handle", "role", "createdAt"]
@@ -268,9 +275,9 @@
         "id": { "type": "string" },
         "actorId": { "type": "string" },
         "actorName": { "type": "string", "maxLength": 100 },
-        "actorRole": { "type": "string", "enum": ["user", "moderator", "admin", "owner"] },
+        "actorRole": { "type": "string", "enum": ["user", "moderator", "room_leader", "assistant_admin", "admin", "owner"] },
         "actionType": { "type": "string", "maxLength": 50 },
-        "targetType": { "type": "string", "enum": ["user", "post", "report", "verification", "appeal"] },
+        "targetType": { "type": "string", "enum": ["user", "post", "report", "verification", "appeal", "room", "event", "title", "role", "announcement", "ad", "sticker_pack", "live_broadcast"] },
         "targetId": { "type": "string", "maxLength": 128 },
         "targetDetails": { "type": "string", "maxLength": 500 },
         "reason": { "type": "string", "maxLength": 500 },
@@ -441,6 +448,60 @@
         "createdAt": { "type": "string" }
       },
       "required": ["id", "groupId", "title", "status", "creatorId", "createdAt"]
+    },
+    "DailyCheckin": {
+      "title": "DailyCheckin",
+      "description": "Deterministic once-per-UTC-day server-enforced daily check-in record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Deterministic ID {userId}_{YYYY}_{M}_{D}" },
+        "userId": { "type": "string", "description": "Claimant UID" },
+        "dateKey": { "type": "string", "description": "UTC date YYYY-MM-DD" },
+        "amount": { "type": "number", "description": "XP awarded" },
+        "createdAt": { "type": "string", "description": "Server ISO timestamp" }
+      },
+      "required": ["id", "userId", "dateKey", "amount", "createdAt"]
+    },
+    "StickerPack": {
+      "title": "StickerPack",
+      "description": "User-submitted or curated sticker pack with moderation lifecycle",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string", "maxLength": 60 },
+        "description": { "type": "string", "maxLength": 240 },
+        "coverURL": { "type": "string", "maxLength": 1000 },
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string", "maxLength": 100 },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected", "disabled"] },
+        "isEnabled": { "type": "boolean" },
+        "moderationNote": { "type": "string", "maxLength": 500 },
+        "stickers": { "type": "array" },
+        "installsCount": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "title", "coverURL", "authorId", "status", "stickers", "createdAt"]
+    },
+    "LiveBroadcast": {
+      "title": "LiveBroadcast",
+      "description": "Real synchronized live broadcast room supporting YouTube embed, external video/HLS, and P2P WebRTC",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string", "maxLength": 120 },
+        "description": { "type": "string", "maxLength": 500 },
+        "mode": { "type": "string", "enum": ["youtube_embed", "external_stream", "camera_webrtc"] },
+        "hostId": { "type": "string" },
+        "hostName": { "type": "string", "maxLength": 100 },
+        "status": { "type": "string", "enum": ["live", "ended"] },
+        "playbackState": { "type": "string", "enum": ["playing", "paused"] },
+        "playbackPositionSec": { "type": "number" },
+        "playbackUpdatedAt": { "type": "string" },
+        "isChatEnabled": { "type": "boolean" },
+        "viewerCount": { "type": "number" },
+        "startedAt": { "type": "string" }
+      },
+      "required": ["id", "title", "mode", "hostId", "status", "startedAt"]
     }
   },
   "firestore": {
@@ -526,6 +587,18 @@
     },
     "/xpLogs/{logId}": {
       "description": "Verified real user XP progression logs"
+    },
+    "/dailyCheckins/{checkinId}": {
+      "schema": { "$ref": "#/entities/DailyCheckin" },
+      "description": "Server-enforced deterministic daily check-in claims keyed by {uid}_{YYYY}_{M}_{D}"
+    },
+    "/stickerPacks/{packId}": {
+      "schema": { "$ref": "#/entities/StickerPack" },
+      "description": "Moderated WhatsApp-style sticker packs for chats and chat rooms"
+    },
+    "/liveBroadcasts/{broadcastId}": {
+      "schema": { "$ref": "#/entities/LiveBroadcast" },
+      "description": "Live broadcast rooms with synchronized playback, viewer presence, live chat, reactions, and WebRTC signaling"
     }
   }
 }

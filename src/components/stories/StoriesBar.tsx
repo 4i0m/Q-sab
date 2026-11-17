@@ -7,6 +7,7 @@ import { useLanguage } from '../../context/LanguageContext';
 import { CreateStoryModal } from './CreateStoryModal';
 import { StoryViewerModal } from './StoryViewerModal';
 import { MediaImage } from '../common/MediaImage';
+import { useLiveUserProfiles } from '../../hooks/useUserProfiles';
 
 interface AuthorStoryGroup {
   authorId: string;
@@ -28,6 +29,7 @@ export function StoriesBar({ onSelectAuthor }: StoriesBarProps) {
   const [viewedMap, setViewedMap] = useState<Record<string, boolean>>({});
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [activeStoryIndex, setActiveStoryIndex] = useState<number | null>(null);
+  const liveAuthors = useLiveUserProfiles(stories.map((s) => s.authorId));
 
   useEffect(() => {
     const unsub = listenToStories(currentUser?.id, (loadedStories) => {
@@ -76,12 +78,15 @@ export function StoriesBar({ onSelectAuthor }: StoriesBarProps) {
       const viewed = currentUser?.id
         ? Boolean(viewedMap[story.id] || story.viewers?.includes(currentUser.id))
         : false;
+      const liveAuthor = liveAuthors[story.authorId];
+      const resolvedName = liveAuthor?.displayName || story.authorName;
+      const resolvedPhoto = liveAuthor ? liveAuthor.photoURL : story.authorPhotoURL;
       const existing = map.get(story.authorId);
       if (!existing) {
         map.set(story.authorId, {
           authorId: story.authorId,
-          authorName: story.authorName,
-          authorPhotoURL: story.authorPhotoURL,
+          authorName: resolvedName,
+          authorPhotoURL: resolvedPhoto,
           stories: [story],
           hasUnviewed: !viewed,
           latestCreatedAt: story.createdAt,
@@ -91,7 +96,7 @@ export function StoriesBar({ onSelectAuthor }: StoriesBarProps) {
         if (!viewed) existing.hasUnviewed = true;
         if (story.createdAt > existing.latestCreatedAt) {
           existing.latestCreatedAt = story.createdAt;
-          if (story.authorPhotoURL) existing.authorPhotoURL = story.authorPhotoURL;
+          if (!liveAuthor && story.authorPhotoURL) existing.authorPhotoURL = story.authorPhotoURL;
         }
       }
     });
@@ -127,7 +132,7 @@ export function StoriesBar({ onSelectAuthor }: StoriesBarProps) {
       orderedStories: flat,
       startIndexByAuthor: startIdxMap,
     };
-  }, [stories, currentUser?.id, viewedMap]);
+  }, [stories, currentUser?.id, viewedMap, liveAuthors]);
 
   return (
     <div className="w-full overflow-x-auto pb-1 scrollbar-none">

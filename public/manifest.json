@@ -1,0 +1,26 @@
+{
+  "name": "Q Social Network",
+  "short_name": "Q",
+  "description": "Exclusive social networking platform with real-time chat rooms, live broadcasts, stories, XP levels, and media sharing.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "dir": "rtl",
+  "lang": "ar",
+  "theme_color": "#0B0F19",
+  "background_color": "#0B0F19",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    }
+  ]
+}

@@ -40,12 +40,12 @@ export function NotificationsView({
   const { currentUser } = useAuth();
   const { isRTL, t } = useLanguage();
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
-  const [filter, setFilter] = useState<'all' | 'follows' | 'likes_comments' | 'messages'>('all');
+  const [filter, setFilter] = useState<'all' | 'follows' | 'likes_comments'>('all');
 
   useEffect(() => {
     if (!currentUser?.id) return;
     const unsub = listenToNotifications(currentUser.id, (loaded) => {
-      setNotifications(loaded);
+      setNotifications(loaded.filter((n) => n.type !== 'message'));
     });
     return () => unsub();
   }, [currentUser?.id]);
@@ -55,7 +55,6 @@ export function NotificationsView({
   const filteredNotifications = notifications.filter((notif) => {
     if (filter === 'follows') return notif.type === 'follow';
     if (filter === 'likes_comments') return notif.type === 'like' || notif.type === 'comment';
-    if (filter === 'messages') return notif.type === 'message';
     return true;
   });
 
@@ -138,17 +137,6 @@ export function NotificationsView({
         >
           {t('followers')}
         </button>
-
-        <button
-          onClick={() => setFilter('messages')}
-          className={`px-4 py-1.5 rounded-xl text-xs font-bold font-tajawal transition-all shrink-0 cursor-pointer ${
-            filter === 'messages'
-              ? 'bg-[#3B6DFF] text-white shadow-md shadow-[#3B6DFF]/25'
-              : 'bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#2A2F3A] text-slate-600 dark:text-[#94A3B8] hover:text-slate-900 dark:hover:text-white'
-          }`}
-        >
-          {t('messages')}
-        </button>
       </div>
 
       <div className="space-y-2">
@@ -182,7 +170,6 @@ export function NotificationsView({
                     {notif.type === 'badge' && <Award className="w-3 h-3 text-[#4F8CFF]" />}
                     {notif.type === 'title' && <Tag className="w-3 h-3 text-amber-500" />}
                     {notif.type === 'verification' && <ShieldCheck className="w-3 h-3 text-[#3B6DFF]" />}
-                    {notif.type === 'message' && <MessageCircle className="w-3 h-3 text-emerald-400" />}
                     {notif.type === 'room_invite' && <MessagesSquare className="w-3 h-3 text-[#3B6DFF]" />}
                     {notif.type === 'moderation' && <ShieldAlert className="w-3 h-3 text-amber-600" />}
                   </div>

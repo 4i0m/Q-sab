@@ -575,7 +575,7 @@ export function uploadMediaWithControl(
       emitState({ status: 'validating', progress: 0 });
 
       const defaultValidation: UploadValidationOptions =
-        folder === 'avatars' || folder === 'banners'
+        folder === 'avatars' || folder === 'banners' || folder === 'stickers' || folder === 'live'
           ? { allowImages: true, allowVideos: false, allowAudio: false }
           : folder === 'audio'
           ? { allowImages: false, allowVideos: false, allowAudio: true }
@@ -890,7 +890,7 @@ export async function uploadFile(
   }
 
   const firstSegment = trimmedPath.split('/')[0] as UploadFolder;
-  const validFolders: UploadFolder[] = ['posts', 'avatars', 'banners', 'groups', 'stories', 'chats', 'audio', 'events', 'rooms'];
+  const validFolders: UploadFolder[] = ['posts', 'avatars', 'banners', 'groups', 'stories', 'chats', 'audio', 'events', 'rooms', 'stickers', 'live'];
   const inferredFolder: UploadFolder = validFolders.includes(firstSegment) ? firstSegment : 'posts';
   const leafName = trimmedPath.split('/').pop() || (file instanceof File ? file.name : `media_${Date.now()}`);
 

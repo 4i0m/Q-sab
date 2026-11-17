@@ -36,7 +36,8 @@ import {
   Flag,
   Copy,
   Info,
-  Sliders
+  Sliders,
+  Smile
 } from 'lucide-react';
 import {
   ChatRoom,
@@ -47,11 +48,11 @@ import {
   ChatRoomModerationLog,
   ChatRoomVisibility,
   RoomPermissions,
-  UserProfile,
-  getSortedUserTitles
+  UserProfile
 } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
+import { useTheme } from '../../context/ThemeContext';
 import { useToast } from '../../context/ToastContext';
 import {
   listenToChatRooms,
@@ -80,8 +81,13 @@ import {
 } from '../../services/firestore';
 import { uploadMediaWithControl, detectMediaKind } from '../../services/storage';
 import { MediaImage } from '../common/MediaImage';
-import { CustomTitleBadge, RoleBadge, VerifiedBadge } from '../common/VerifiedBadge';
+import { RoleBadge, VerifiedBadge } from '../common/VerifiedBadge';
+import { StickerDrawer, SelectedStickerPayload } from '../chat/StickerDrawer';
+import { ChatBackgroundPicker } from '../chat/ChatBackgroundPicker';
+import { CHAT_BACKGROUND_PRESETS, resolveChatBackgroundStyle } from '../../utils/chatBackgrounds';
 import { formatRelativeTime } from '../../utils/date';
+import { useLiveUserProfiles } from '../../hooks/useUserProfiles';
+import { matchesSearchQuery } from '../../utils/search';
 
 interface ChatRoomsViewProps {
   onSelectAuthor: (userId: string) => void;
@@ -123,6 +129,7 @@ export function ChatRoomsView({
 }: ChatRoomsViewProps) {
   const { currentUser, isAdmin, isStaff, onlineUsers } = useAuth();
   const { isRTL } = useLanguage();
+  const { resolvedTheme } = useTheme();
   const { showToast } = useToast();
 
   const [rooms, setRooms] = useState<ChatRoom[]>([]);
@@ -146,6 +153,7 @@ export function ChatRoomsView({
   const [sendingMsg, setSendingMsg] = useState(false);
   const [uploadingMedia, setUploadingMedia] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [showStickers, setShowStickers] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -188,7 +196,9 @@ export function ChatRoomsView({
   const [appTitle, setAppTitle] = useState('');
   const [appDesc, setAppDesc] = useState('');
   const [appBgColor, setAppBgColor] = useState('');
+  const [appBgPresetId, setAppBgPresetId] = useState('default');
   const [appBgImageURL, setAppBgImageURL] = useState('');
+  const [appBgScrim, setAppBgScrim] = useState(0.58);
   const [appCoverURL, setAppCoverURL] = useState('');
   const [appImageURL, setAppImageURL] = useState('');
   const [appAccentColor, setAppAccentColor] = useState('#3B6DFF');
@@ -196,13 +206,14 @@ export function ChatRoomsView({
   const [uploadingAppearanceMedia, setUploadingAppearanceMedia] = useState(false);
   const [savingAppearance, setSavingAppearance] = useState(false);
 
-  // Personal Local Override toggle
+  // Personal Local Override toggle & background picker
   const [personalUseRoomTheme, setPersonalUseRoomTheme] = useState(
     currentUser?.customization?.chatPreferences?.useRoomTheme !== false
   );
   const [personalBubbleTheme, setPersonalBubbleTheme] = useState<ChatRoomAppearance['bubbleTheme']>(
     currentUser?.customization?.chatPreferences?.bubbleTheme || 'classic'
   );
+  const [showPersonalBgPicker, setShowPersonalBgPicker] = useState(false);
 
   // Invite Modal & Delete / Transfer Confirmations
   const [showInviteModal, setShowInviteModal] = useState(false);
@@ -215,6 +226,28 @@ export function ChatRoomsView({
   const [transferringOwnership, setTransferringOwnership] = useState(false);
 
   const onlineIds = useMemo(() => new Set(onlineUsers.map((u) => u.userId)), [onlineUsers]);
+
+  const trackedUserIds = useMemo(() => {
+    const ids: string[] = [];
+    rooms.forEach((r) => {
+      if (r.ownerId) ids.push(r.ownerId);
+      if (r.lastMessageSenderId) ids.push(r.lastMessageSenderId);
+    });
+    if (activeRoom?.ownerId) ids.push(activeRoom.ownerId);
+    (activeRoom?.bannedUserIds || []).forEach((uid) => ids.push(uid));
+    members.forEach((m) => {
+      if (m.userId) ids.push(m.userId);
+    });
+    messages.forEach((msg) => {
+      if (msg.senderId) ids.push(msg.senderId);
+    });
+    return ids;
+  }, [rooms, activeRoom?.ownerId, activeRoom?.bannedUserIds, members, messages]);
+
+  const liveProfiles = useLiveUserProfiles(trackedUserIds);
+
+  const getLiveRoomOwnerName = (room: ChatRoom) =>
+    liveProfiles[room.ownerId]?.displayName || room.ownerName || 'مستخدم Q';
 
   useEffect(() => {
     setPersonalUseRoomTheme(currentUser?.customization?.chatPreferences?.useRoomTheme !== false);
@@ -284,7 +317,9 @@ export function ChatRoomsView({
     setAppTitle(activeRoom.title || '');
     setAppDesc(activeRoom.description || '');
     setAppBgColor(activeRoom.appearance?.bgColor || '');
+    setAppBgPresetId(activeRoom.appearance?.bgPresetId || 'default');
     setAppBgImageURL(activeRoom.appearance?.bgImageURL || '');
+    setAppBgScrim(activeRoom.appearance?.bgScrimOpacity ?? 0.58);
     setAppCoverURL(activeRoom.coverURL || '');
     setAppImageURL(activeRoom.imageURL || '');
     setAppAccentColor(activeRoom.appearance?.accentColor || '#3B6DFF');
@@ -553,6 +588,41 @@ export function ChatRoomsView({
     }
   };
 
+  const handleSendRoomSticker = async (sticker: SelectedStickerPayload) => {
+    if (!currentUser || !activeRoom || sendingMsg) return;
+    setShowStickers(false);
+    if (!isMember) {
+      try {
+        await joinChatRoom(activeRoom, currentUser);
+      } catch (err: any) {
+        showToast(err?.message || 'انضم إلى الغرفة أولاً للمشاركة.', 'error');
+        return;
+      }
+    }
+    try {
+      setSendingMsg(true);
+      await sendChatRoomMessage(activeRoom, currentUser, {
+        text: sticker.label || '',
+        messageType: 'sticker',
+        stickerId: sticker.stickerId,
+        stickerUrl: sticker.url,
+        stickerPackId: sticker.packId,
+        replyTo: replyingTo
+          ? {
+              id: replyingTo.id,
+              senderName: replyingTo.senderName,
+              text: (replyingTo.text || (replyingTo.mediaURL ? 'وسائط' : 'رسالة')).slice(0, 70),
+            }
+          : undefined,
+      });
+      setReplyingTo(null);
+    } catch (err: any) {
+      showToast(err?.message || 'تعذر إرسال الملصق.', 'error');
+    } finally {
+      setSendingMsg(false);
+    }
+  };
+
   const handleSaveRoomAppearance = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeRoom) return;
@@ -567,7 +637,9 @@ export function ChatRoomsView({
           imageURL: appImageURL,
           coverURL: appCoverURL,
           bgColor: appBgColor,
+          bgPresetId: appBgPresetId,
           bgImageURL: appBgImageURL,
+          bgScrimOpacity: appBgScrim,
           accentColor: appAccentColor,
           bubbleTheme: appBubbleTheme,
         },
@@ -577,6 +649,53 @@ export function ChatRoomsView({
       showToast(err?.message || 'تعذر حفظ المظهر.', 'error');
     } finally {
       setSavingAppearance(false);
+    }
+  };
+
+  const handleSavePersonalRoomBg = async (options: {
+    presetId: string;
+    bgImageURL: string;
+  }) => {
+    if (!currentUser || !activeRoom) return;
+    const prevCustom = currentUser.customization || {};
+    const prevChat = prevCustom.chatPreferences || {};
+    try {
+      await updateUserProfileCustomization(currentUser.id, {
+        ...prevCustom,
+        chatPreferences: {
+          ...prevChat,
+          roomBackgroundOverrides: {
+            ...(prevChat.roomBackgroundOverrides || {}),
+            [activeRoom.id]: {
+              presetId: options.presetId,
+              imageURL: options.bgImageURL || '',
+            },
+          },
+        },
+      });
+      showToast('تم تطبيق الخلفية الشخصية لهذه الغرفة.', 'success');
+    } catch {
+      showToast('تعذر حفظ الخلفية الشخصية.', 'error');
+    }
+  };
+
+  const handleResetPersonalRoomBg = async () => {
+    if (!currentUser || !activeRoom) return;
+    const prevCustom = currentUser.customization || {};
+    const prevChat = prevCustom.chatPreferences || {};
+    const nextOverrides = { ...(prevChat.roomBackgroundOverrides || {}) };
+    delete nextOverrides[activeRoom.id];
+    try {
+      await updateUserProfileCustomization(currentUser.id, {
+        ...prevCustom,
+        chatPreferences: {
+          ...prevChat,
+          roomBackgroundOverrides: nextOverrides,
+        },
+      });
+      showToast('تمت استعادة مظهر الغرفة الافتراضي.', 'info');
+    } catch {
+      showToast('تعذر إعادة الضبط.', 'error');
     }
   };
 
@@ -753,11 +872,12 @@ export function ChatRoomsView({
     }
 
     if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      return (
-        r.title.toLowerCase().includes(q) ||
-        (r.description || '').toLowerCase().includes(q) ||
-        (r.topic || '').toLowerCase().includes(q)
+      return matchesSearchQuery(
+        searchQuery,
+        r.title,
+        r.description,
+        r.topic,
+        getLiveRoomOwnerName(r)
       );
     }
     return true;
@@ -770,8 +890,36 @@ export function ChatRoomsView({
   // ============================================================================
   if (activeRoomId && activeRoom) {
     const activeAccent = activeRoom.appearance?.accentColor || '#3B6DFF';
-    const effectiveBgColor = personalUseRoomTheme ? activeRoom.appearance?.bgColor || '' : '';
-    const effectiveBgImg = personalUseRoomTheme ? activeRoom.appearance?.bgImageURL || '' : '';
+    const personalRoomOverride =
+      currentUser?.customization?.chatPreferences?.roomBackgroundOverrides?.[activeRoom.id];
+    const effectiveBgPresetId = personalRoomOverride
+      ? personalRoomOverride.presetId || 'default'
+      : personalUseRoomTheme
+      ? activeRoom.appearance?.bgPresetId || 'default'
+      : 'default';
+    const effectiveBgColor =
+      !personalRoomOverride && personalUseRoomTheme ? activeRoom.appearance?.bgColor || '' : '';
+    const effectiveBgImg = personalRoomOverride
+      ? personalRoomOverride.imageURL || ''
+      : personalUseRoomTheme
+      ? activeRoom.appearance?.bgImageURL || ''
+      : '';
+    const effectiveScrim = activeRoom.appearance?.bgScrimOpacity ?? 0.58;
+    const roomBgResolved = resolveChatBackgroundStyle({
+      presetId: effectiveBgPresetId,
+      bgColor: effectiveBgColor,
+      bgImageURL: effectiveBgImg,
+      resolvedTheme,
+    });
+    const roomCanvasStyle = roomBgResolved.hasCustomImage
+      ? {
+          ...roomBgResolved.style,
+          backgroundImage: `linear-gradient(rgba(9,13,22,${effectiveScrim}), rgba(9,13,22,${Math.min(
+            0.9,
+            effectiveScrim + 0.1
+          )})), ${roomBgResolved.style.backgroundImage}`,
+        }
+      : roomBgResolved.style;
     const effectiveBubbleTheme = personalUseRoomTheme
       ? activeRoom.appearance?.bubbleTheme || 'classic'
       : personalBubbleTheme || 'classic';
@@ -834,7 +982,7 @@ export function ChatRoomsView({
     };
 
     return (
-      <div className="fixed inset-0 z-30 lg:static lg:z-auto w-full lg:max-w-3xl lg:mx-auto flex flex-col h-[100dvh] lg:h-[calc(100dvh-5.5rem)] bg-white dark:bg-[#0B0F19] lg:border lg:border-slate-200 lg:dark:border-[#242B38] lg:rounded-3xl overflow-hidden shadow-xl font-ar">
+      <div className="fixed inset-0 z-40 lg:static lg:z-auto w-full lg:max-w-3xl lg:mx-auto flex flex-col h-[100dvh] lg:h-[calc(100dvh-5.5rem)] bg-white dark:bg-[#0B0F19] lg:border lg:border-slate-200 lg:dark:border-[#242B38] lg:rounded-3xl overflow-hidden shadow-xl font-ar">
         {/* Top Native Header */}
         <header className="shrink-0 px-2.5 sm:px-4 py-2.5 border-b border-slate-200/80 dark:border-[#242B38] bg-white/95 dark:bg-[#111622]/95 backdrop-blur-xl flex items-center justify-between gap-2 pt-[max(0.5rem,env(safe-area-inset-top))] lg:pt-2.5">
           <div className="flex items-center gap-1.5 min-w-0">
@@ -953,7 +1101,8 @@ export function ChatRoomsView({
               <Pin className="w-3.5 h-3.5 shrink-0" style={{ color: activeAccent }} />
               <div className="min-w-0 flex-1">
                 <span className="text-[10px] font-bold block" style={{ color: activeAccent }}>
-                  رسالة مثبتة ({(pinnedIdx % pinnedMessages.length) + 1}/{pinnedMessages.length}) · {activePinnedMsg.senderName}
+                  رسالة مثبتة ({(pinnedIdx % pinnedMessages.length) + 1}/{pinnedMessages.length}) ·{' '}
+                  {liveProfiles[activePinnedMsg.senderId]?.displayName || activePinnedMsg.senderName}
                 </span>
                 <p className="text-xs text-slate-700 dark:text-slate-200 truncate">
                   {activePinnedMsg.text || (activePinnedMsg.mediaURL ? 'وسائط مرفقة' : '')}
@@ -1009,18 +1158,11 @@ export function ChatRoomsView({
 
         {/* Chat Stream Canvas with Custom Background & Protective Contrast Layer */}
         <div
-          style={{
-            ...(effectiveBgColor ? { backgroundColor: effectiveBgColor } : {}),
-            ...(effectiveBgImg
-              ? {
-                  backgroundImage: `linear-gradient(rgba(9,13,22,0.58), rgba(9,13,22,0.68)), url(${effectiveBgImg})`,
-                  backgroundSize: 'cover',
-                  backgroundPosition: 'center',
-                }
-              : {}),
-          }}
-          className={`flex-1 overflow-y-auto px-3 sm:px-4 py-3 space-y-1.5 ${
-            !effectiveBgColor && !effectiveBgImg ? 'chat-canvas-pattern' : ''
+          style={roomCanvasStyle}
+          className={`flex-1 overflow-y-auto overflow-x-hidden px-3 sm:px-4 py-3 space-y-1.5 ${
+            effectiveBgPresetId === 'default' && !effectiveBgColor && !effectiveBgImg
+              ? 'chat-canvas-pattern'
+              : ''
           }`}
         >
           {/* Clickable Owner Intro Card */}
@@ -1038,7 +1180,7 @@ export function ChatRoomsView({
               style={{ color: activeAccent }}
             >
               <Crown className="w-3 h-3" />
-              <span>بقيادة {activeRoom.ownerName}</span>
+              <span>بقيادة {getLiveRoomOwnerName(activeRoom)}</span>
             </button>
           </div>
 
@@ -1062,10 +1204,10 @@ export function ChatRoomsView({
               const isGroupedNext = Boolean(
                 nextMsg && nextMsg.senderId === msg.senderId && getDateLabel(nextMsg.createdAt) === getDateLabel(msg.createdAt)
               );
-              const senderTitles = getSortedUserTitles({
-                customTitle: msg.senderCustomTitle,
-                customTitles: msg.senderCustomTitles,
-              });
+              const liveSender = liveProfiles[msg.senderId];
+              const senderDisplayName = liveSender ? liveSender.displayName : msg.senderName;
+              const senderAvatar = liveSender ? liveSender.photoURL : msg.senderPhotoURL;
+              const senderPlatformRole = liveSender?.role || msg.senderRole;
               const reactionsEntries = Object.entries(msg.reactions || {}).filter(([, u]) => u.length > 0);
               const isHighlighted = highlightedMsgId === msg.id;
 
@@ -1096,10 +1238,10 @@ export function ChatRoomsView({
                             className="cursor-pointer block"
                           >
                             <MediaImage
-                              src={msg.senderPhotoURL}
-                              alt={msg.senderName}
+                              src={senderAvatar}
+                              alt={senderDisplayName}
                               variant="avatar"
-                              fallbackText={msg.senderName}
+                              fallbackText={senderDisplayName}
                               containerClassName="w-8 h-8 rounded-full overflow-hidden border border-white/40 dark:border-[#2A2F3A]"
                               className="w-full h-full object-cover"
                             />
@@ -1108,18 +1250,18 @@ export function ChatRoomsView({
                       </div>
                     )}
 
-                    <div className={`max-w-[82%] sm:max-w-[74%] flex flex-col ${isMine ? 'items-end' : 'items-start'}`}>
+                    <div className={`max-w-[82%] sm:max-w-[74%] min-w-0 flex flex-col ${isMine ? 'items-end' : 'items-start'}`}>
                       {!isGroupedPrev && (
-                        <div className="flex items-center gap-1.5 flex-wrap mb-1 px-1">
+                        <div className="flex items-center gap-1.5 flex-wrap mb-1 px-1 max-w-full">
                           {!isMine && (
                             <button
                               type="button"
                               onClick={() => onSelectAuthor(msg.senderId)}
-                              className={`text-[11px] font-extrabold cursor-pointer hover:underline ${
+                              className={`text-[11px] font-extrabold cursor-pointer hover:underline truncate max-w-[180px] ${
                                 effectiveBgImg ? 'text-white drop-shadow-sm' : 'text-slate-900 dark:text-white'
                               }`}
                             >
-                              {msg.senderName}
+                              {senderDisplayName}
                             </button>
                           )}
                           {msg.senderRoomRole === 'owner' && (
@@ -1137,14 +1279,13 @@ export function ChatRoomsView({
                               نائب مشرف
                             </span>
                           )}
-                          {msg.senderRole && msg.senderRole !== 'user' && <RoleBadge role={msg.senderRole} />}
-                          {senderTitles.slice(0, 2).map((t, i) => (
-                            <CustomTitleBadge key={t.id || `${t.text}_${i}`} title={t} compact />
-                          ))}
+                          {senderPlatformRole && senderPlatformRole !== 'user' && (
+                            <RoleBadge role={senderPlatformRole} />
+                          )}
                         </div>
                       )}
 
-                      <div className="flex items-center gap-1 max-w-full">
+                      <div className="flex items-center gap-1 max-w-full min-w-0">
                         {isMine && !msg.isDeleted && (
                           <button
                             type="button"
@@ -1156,86 +1297,112 @@ export function ChatRoomsView({
                           </button>
                         )}
 
-                        <div
-                          onTouchStart={() => startLongPress(msg)}
-                          onTouchEnd={cancelLongPress}
-                          onTouchMove={cancelLongPress}
-                          onContextMenu={(e) => {
-                            if (!msg.isDeleted) {
-                              e.preventDefault();
-                              setSheetMsg(msg);
-                            }
-                          }}
-                          style={
-                            isMine &&
-                            !msg.isDeleted &&
-                            (effectiveBubbleTheme === 'classic' || effectiveBubbleTheme === 'glass')
-                              ? { backgroundColor: effectiveBubbleTheme === 'glass' ? `${activeAccent}CC` : activeAccent }
-                              : undefined
-                          }
-                          className={`relative px-3.5 py-2 text-[13.5px] leading-relaxed select-text ${
-                            msg.isDeleted
-                              ? 'bg-white/75 dark:bg-[#161B26]/75 border border-slate-200 dark:border-[#242B38] text-slate-400 italic rounded-2xl text-xs'
-                              : getBubbleClasses(isMine, isGroupedNext)
-                          }`}
-                        >
-                          {msg.isDeleted ? (
-                            <span>تم حذف هذه الرسالة ({msg.deletedByName || 'إجراء إشرافي'})</span>
-                          ) : (
-                            <>
-                              {msg.replyTo && (
-                                <button
-                                  type="button"
-                                  onClick={() => jumpToMessage(msg.replyTo!.id)}
-                                  className={`mb-1.5 w-full text-start p-2 rounded-xl text-[11px] border cursor-pointer ${
-                                    isMine
-                                      ? 'bg-black/20 border-white/25 text-white/95'
-                                      : 'bg-slate-50 dark:bg-[#0B0F19] border-slate-200 dark:border-[#242B38] text-slate-600 dark:text-slate-300'
-                                  }`}
-                                >
-                                  <span className="font-bold block">{msg.replyTo.senderName}</span>
-                                  <span className="line-clamp-1 opacity-90">{msg.replyTo.text}</span>
-                                </button>
+                        {(() => {
+                          const isStickerMsg = Boolean(msg.messageType === 'sticker' && msg.stickerUrl);
+                          return (
+                            <div
+                              onTouchStart={() => startLongPress(msg)}
+                              onTouchEnd={cancelLongPress}
+                              onTouchMove={cancelLongPress}
+                              onContextMenu={(e) => {
+                                if (!msg.isDeleted) {
+                                  e.preventDefault();
+                                  setSheetMsg(msg);
+                                }
+                              }}
+                              style={
+                                !isStickerMsg &&
+                                isMine &&
+                                !msg.isDeleted &&
+                                (effectiveBubbleTheme === 'classic' || effectiveBubbleTheme === 'glass')
+                                  ? { backgroundColor: effectiveBubbleTheme === 'glass' ? `${activeAccent}CC` : activeAccent }
+                                  : undefined
+                              }
+                              className={`relative max-w-full min-w-0 px-3.5 py-2 text-[13.5px] leading-relaxed select-text ${
+                                isStickerMsg
+                                  ? 'bg-transparent shadow-none p-1'
+                                  : msg.isDeleted
+                                  ? 'bg-white/75 dark:bg-[#161B26]/75 border border-slate-200 dark:border-[#242B38] text-slate-400 italic rounded-2xl text-xs'
+                                  : getBubbleClasses(isMine, isGroupedNext)
+                              }`}
+                            >
+                              {msg.isDeleted ? (
+                                <span>تم حذف هذه الرسالة ({msg.deletedByName || 'إجراء إشرافي'})</span>
+                              ) : (
+                                <>
+                                  {msg.replyTo && (
+                                    <button
+                                      type="button"
+                                      onClick={() => jumpToMessage(msg.replyTo!.id)}
+                                      className={`mb-1.5 w-full text-start p-2 rounded-xl text-[11px] border cursor-pointer ${
+                                        isMine
+                                          ? 'bg-black/20 border-white/25 text-white/95'
+                                          : 'bg-slate-50 dark:bg-[#0B0F19] border-slate-200 dark:border-[#242B38] text-slate-600 dark:text-slate-300'
+                                      }`}
+                                    >
+                                      <span className="font-bold block">{msg.replyTo.senderName}</span>
+                                      <span className="line-clamp-1 opacity-90">{msg.replyTo.text}</span>
+                                    </button>
+                                  )}
+
+                                  {isStickerMsg && msg.stickerUrl ? (
+                                    <MediaImage
+                                      src={msg.stickerUrl}
+                                      alt={msg.text || 'ملصق'}
+                                      variant="thumbnail"
+                                      containerClassName="w-28 h-28 overflow-hidden rounded-2xl"
+                                      className="w-full h-full object-contain drop-shadow-md"
+                                    />
+                                  ) : null}
+
+                                  {msg.mediaURL && msg.mediaType === 'video' ? (
+                                    <video
+                                      src={msg.mediaURL}
+                                      controls
+                                      playsInline
+                                      className="mb-1.5 w-full max-w-[260px] min-w-0 rounded-xl bg-black"
+                                    />
+                                  ) : msg.mediaURL ? (
+                                    <div
+                                      onClick={() => setLightboxUrl(msg.mediaURL!)}
+                                      className="mb-1.5 w-full max-w-[260px] min-w-0 rounded-xl overflow-hidden border border-black/10 cursor-pointer"
+                                    >
+                                      <MediaImage
+                                        src={msg.mediaURL}
+                                        alt=""
+                                        variant="chat"
+                                        containerClassName="w-full max-h-64 overflow-hidden"
+                                        className="w-full h-full object-cover"
+                                      />
+                                    </div>
+                                  ) : null}
+
+                                  {!isStickerMsg && msg.text && (
+                                    <p className="whitespace-pre-line break-words [overflow-wrap:anywhere] text-start">
+                                      {msg.text}
+                                    </p>
+                                  )}
+
+                                  <div
+                                    className={`mt-1 flex items-center justify-end gap-1.5 text-[9.5px] tabular-nums ${
+                                      isStickerMsg
+                                        ? effectiveBgImg
+                                          ? 'text-white/85 drop-shadow-xs'
+                                          : 'text-slate-500 dark:text-[#94A3B8]'
+                                        : isMine
+                                        ? 'text-white/80'
+                                        : 'text-slate-400 dark:text-[#64748B]'
+                                    }`}
+                                  >
+                                    {msg.isPinned && <Pin className="w-2.5 h-2.5" />}
+                                    {msg.editedAt && <span>(معدّلة)</span>}
+                                    <span>{formatRelativeTime(msg.createdAt)}</span>
+                                  </div>
+                                </>
                               )}
-
-                              {msg.mediaURL && msg.mediaType === 'video' ? (
-                                <video
-                                  src={msg.mediaURL}
-                                  controls
-                                  playsInline
-                                  className="mb-1.5 max-w-[260px] rounded-xl bg-black"
-                                />
-                              ) : msg.mediaURL ? (
-                                <div
-                                  onClick={() => setLightboxUrl(msg.mediaURL!)}
-                                  className="mb-1.5 max-w-[260px] rounded-xl overflow-hidden border border-black/10 cursor-pointer"
-                                >
-                                  <MediaImage
-                                    src={msg.mediaURL}
-                                    alt=""
-                                    variant="chat"
-                                    containerClassName="w-full max-h-64 overflow-hidden"
-                                    className="w-full h-full object-cover"
-                                  />
-                                </div>
-                              ) : null}
-
-                              {msg.text && (
-                                <p className="whitespace-pre-line break-words text-start">{msg.text}</p>
-                              )}
-
-                              <div
-                                className={`mt-1 flex items-center justify-end gap-1.5 text-[9.5px] tabular-nums ${
-                                  isMine ? 'text-white/80' : 'text-slate-400 dark:text-[#64748B]'
-                                }`}
-                              >
-                                {msg.isPinned && <Pin className="w-2.5 h-2.5" />}
-                                {msg.editedAt && <span>(معدّلة)</span>}
-                                <span>{formatRelativeTime(msg.createdAt)}</span>
-                              </div>
-                            </>
-                          )}
-                        </div>
+                            </div>
+                          );
+                        })()}
 
                         {!isMine && !msg.isDeleted && (
                           <button
@@ -1280,97 +1447,120 @@ export function ChatRoomsView({
         </div>
 
         {/* Bottom Safe-Area Composer */}
-        <form
-          onSubmit={handleSubmitMessage}
-          className="shrink-0 p-2.5 sm:p-3 border-t border-slate-200 dark:border-[#242B38] bg-white/95 dark:bg-[#111622]/95 backdrop-blur-xl space-y-2 pb-[max(0.65rem,env(safe-area-inset-bottom))]"
-        >
-          {(replyingTo || editingMsg) && (
-            <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-[#3B6DFF]/10 text-xs text-[#3B6DFF]">
-              <span className="truncate">
-                {editingMsg ? (
-                  <>
-                    تعديل رسالتك: <strong>{editingMsg.text.slice(0, 45)}</strong>
-                  </>
-                ) : (
-                  <>
-                    الرد على <strong>{replyingTo?.senderName}</strong>: {(replyingTo?.text || '').slice(0, 45)}
-                  </>
-                )}
-              </span>
-              <button
-                type="button"
-                onClick={() => {
-                  setReplyingTo(null);
-                  if (editingMsg) {
-                    setEditingMsg(null);
-                    setMsgText('');
+        <div className="shrink-0 bg-white/95 dark:bg-[#111622]/95 backdrop-blur-xl border-t border-slate-200 dark:border-[#242B38] pb-[max(0.65rem,env(safe-area-inset-bottom))]">
+          <StickerDrawer
+            isOpen={showStickers}
+            onClose={() => setShowStickers(false)}
+            onSelectSticker={handleSendRoomSticker}
+            accentColor={activeAccent}
+          />
+          <form
+            onSubmit={handleSubmitMessage}
+            className="p-2.5 sm:p-3 space-y-2"
+          >
+            {(replyingTo || editingMsg) && (
+              <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-[#3B6DFF]/10 text-xs text-[#3B6DFF]">
+                <span className="truncate">
+                  {editingMsg ? (
+                    <>
+                      تعديل رسالتك: <strong>{editingMsg.text.slice(0, 45)}</strong>
+                    </>
+                  ) : (
+                    <>
+                      الرد على <strong>{replyingTo?.senderName}</strong>: {(replyingTo?.text || '').slice(0, 45)}
+                    </>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setReplyingTo(null);
+                    if (editingMsg) {
+                      setEditingMsg(null);
+                      setMsgText('');
+                    }
+                  }}
+                  className="cursor-pointer shrink-0 p-1"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
+            {uploadingMedia && (
+              <div className="flex items-center gap-2 text-xs text-[#3B6DFF] px-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <span>جاري رفع الوسائط... {uploadProgress}%</span>
+              </div>
+            )}
+
+            {isMutedInRoom ? (
+              <div className="min-h-[44px] rounded-2xl bg-red-500/10 border border-red-500/25 px-4 flex items-center justify-center gap-2 text-xs font-bold text-red-600 dark:text-red-400">
+                <VolumeX className="w-4 h-4 shrink-0" />
+                <span>أنت مكتوم من إرسال الرسائل في هذه الغرفة حالياً.</span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5 sm:gap-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm"
+                  onChange={handleSendMedia}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={!currentUser || uploadingMedia || Boolean(editingMsg)}
+                  className="min-w-[44px] min-h-[44px] rounded-2xl bg-slate-100 dark:bg-[#1B2232] text-slate-600 dark:text-slate-300 hover:text-[#3B6DFF] flex items-center justify-center cursor-pointer disabled:opacity-40 shrink-0"
+                  aria-label="إرفاق صورة أو فيديو"
+                >
+                  <ImagePlus className="w-5 h-5" />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowStickers((prev) => !prev)}
+                  disabled={!currentUser || Boolean(editingMsg)}
+                  className={`min-w-[44px] min-h-[44px] rounded-2xl flex items-center justify-center cursor-pointer disabled:opacity-40 shrink-0 ${
+                    showStickers
+                      ? 'bg-[#3B6DFF] text-white'
+                      : 'bg-slate-100 dark:bg-[#1B2232] text-slate-600 dark:text-slate-300 hover:text-[#3B6DFF]'
+                  }`}
+                  aria-label="الملصقات"
+                  title="الملصقات"
+                >
+                  <Smile className="w-5 h-5" />
+                </button>
+
+                <input
+                  type="text"
+                  value={msgText}
+                  onChange={(e) => setMsgText(e.target.value)}
+                  placeholder={
+                    editingMsg
+                      ? 'اكتب النص المعدّل...'
+                      : currentUser
+                      ? 'اكتب رسالتك في الغرفة...'
+                      : 'سجّل الدخول للمشاركة'
                   }
-                }}
-                className="cursor-pointer shrink-0 p-1"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          )}
+                  disabled={!currentUser || sendingMsg}
+                  className="flex-1 min-w-0 min-h-[44px] bg-slate-100 dark:bg-[#0B0F19] border border-slate-200 dark:border-[#242B38] focus:border-[#3B6DFF] rounded-2xl px-4 text-xs sm:text-sm text-slate-900 dark:text-white focus:outline-none"
+                />
 
-          {uploadingMedia && (
-            <div className="flex items-center gap-2 text-xs text-[#3B6DFF] px-2">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              <span>جاري رفع الوسائط... {uploadProgress}%</span>
-            </div>
-          )}
-
-          {isMutedInRoom ? (
-            <div className="min-h-[44px] rounded-2xl bg-red-500/10 border border-red-500/25 px-4 flex items-center justify-center gap-2 text-xs font-bold text-red-600 dark:text-red-400">
-              <VolumeX className="w-4 h-4 shrink-0" />
-              <span>أنت مكتوم من إرسال الرسائل في هذه الغرفة حالياً.</span>
-            </div>
-          ) : (
-            <div className="flex items-center gap-2">
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm"
-                onChange={handleSendMedia}
-                className="hidden"
-              />
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={!currentUser || uploadingMedia || Boolean(editingMsg)}
-                className="min-w-[44px] min-h-[44px] rounded-2xl bg-slate-100 dark:bg-[#1B2232] text-slate-600 dark:text-slate-300 hover:text-[#3B6DFF] flex items-center justify-center cursor-pointer disabled:opacity-40"
-                aria-label="إرفاق صورة أو فيديو"
-              >
-                <ImagePlus className="w-5 h-5" />
-              </button>
-
-              <input
-                type="text"
-                value={msgText}
-                onChange={(e) => setMsgText(e.target.value)}
-                placeholder={
-                  editingMsg
-                    ? 'اكتب النص المعدّل...'
-                    : currentUser
-                    ? 'اكتب رسالتك في الغرفة...'
-                    : 'سجّل الدخول للمشاركة'
-                }
-                disabled={!currentUser || sendingMsg}
-                className="flex-1 min-h-[44px] bg-slate-100 dark:bg-[#0B0F19] border border-slate-200 dark:border-[#242B38] focus:border-[#3B6DFF] rounded-2xl px-4 text-xs sm:text-sm text-slate-900 dark:text-white focus:outline-none"
-              />
-
-              <button
-                type="submit"
-                disabled={!currentUser || !msgText.trim() || sendingMsg}
-                style={{ backgroundColor: activeAccent }}
-                className="min-w-[44px] min-h-[44px] rounded-2xl text-white flex items-center justify-center disabled:opacity-40 cursor-pointer shadow-md"
-                aria-label={editingMsg ? 'حفظ التعديل' : 'إرسال'}
-              >
-                {sendingMsg ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-              </button>
-            </div>
-          )}
-        </form>
+                <button
+                  type="submit"
+                  disabled={!currentUser || !msgText.trim() || sendingMsg}
+                  style={{ backgroundColor: activeAccent }}
+                  className="min-w-[44px] min-h-[44px] rounded-2xl text-white flex items-center justify-center disabled:opacity-40 cursor-pointer shadow-md shrink-0"
+                  aria-label={editingMsg ? 'حفظ التعديل' : 'إرسال'}
+                >
+                  {sendingMsg ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                </button>
+              </div>
+            )}
+          </form>
+        </div>
 
         {/* Mobile Long-Press / Contextual Action Bottom Sheet */}
         {sheetMsg && (
@@ -1583,7 +1773,7 @@ export function ChatRoomsView({
                       className="text-[11px] text-amber-300 font-bold hover:underline cursor-pointer flex items-center gap-1"
                     >
                       <Crown className="w-3 h-3" />
-                      <span>المالك: {activeRoom.ownerName}</span>
+                      <span>المالك: {getLiveRoomOwnerName(activeRoom)}</span>
                     </button>
                   </div>
                 </div>
@@ -1678,12 +1868,14 @@ export function ChatRoomsView({
                     ]
                       .filter((grp) => grp.list.length > 0)
                       .map((grp) => {
-                        const filteredList = grp.list.filter(
-                          (m) =>
-                            !memberSearch.trim() ||
-                            m.displayName.toLowerCase().includes(memberSearch.toLowerCase()) ||
-                            m.handle.toLowerCase().includes(memberSearch.toLowerCase())
-                        );
+                        const filteredList = grp.list.filter((m) => {
+                          const liveM = liveProfiles[m.userId];
+                          return matchesSearchQuery(
+                            memberSearch,
+                            liveM?.displayName || m.displayName,
+                            liveM?.handle || m.handle
+                          );
+                        });
                         if (filteredList.length === 0) return null;
                         return (
                           <div key={grp.title} className="space-y-1.5">
@@ -1691,6 +1883,12 @@ export function ChatRoomsView({
                               {grp.title} ({filteredList.length})
                             </h4>
                             {filteredList.map((m) => {
+                              const liveM = liveProfiles[m.userId];
+                              const mName = liveM ? liveM.displayName : m.displayName;
+                              const mHandle = liveM ? liveM.handle : m.handle;
+                              const mPhoto = liveM ? liveM.photoURL : m.photoURL;
+                              const mVerified = liveM ? liveM.isVerified : Boolean(m.isVerified);
+                              const mCategory = liveM?.verificationCategory || m.verificationCategory || 'blue';
                               const isTargetOwner = m.userId === activeRoom.ownerId || m.role === 'owner';
                               const isTargetMuted = (activeRoom.mutedUserIds || []).includes(m.userId);
                               const canModThis = Boolean(
@@ -1711,21 +1909,21 @@ export function ChatRoomsView({
                                       className="flex items-center gap-2.5 min-w-0 text-start cursor-pointer"
                                     >
                                       <MediaImage
-                                        src={m.photoURL}
-                                        alt={m.displayName}
+                                        src={mPhoto}
+                                        alt={mName}
                                         variant="avatar"
-                                        fallbackText={m.displayName}
+                                        fallbackText={mName}
                                         containerClassName="w-9 h-9 rounded-full overflow-hidden shrink-0"
                                         className="w-full h-full object-cover"
                                       />
                                       <div className="min-w-0">
                                         <div className="flex items-center gap-1">
                                           <span className="text-xs font-bold text-slate-900 dark:text-white truncate">
-                                            {m.displayName}
+                                            {mName}
                                           </span>
-                                          {m.isVerified && (
+                                          {mVerified && (
                                             <VerifiedBadge
-                                              category={m.verificationCategory || 'blue'}
+                                              category={mCategory}
                                               className="w-3.5 h-3.5"
                                               interactive={false}
                                             />
@@ -1735,7 +1933,7 @@ export function ChatRoomsView({
                                           )}
                                         </div>
                                         <span className="font-handle text-[10px] text-slate-500 block">
-                                          @{m.handle}
+                                          @{mHandle}
                                         </span>
                                       </div>
                                     </button>
@@ -1873,7 +2071,7 @@ export function ChatRoomsView({
                               }}
                               className="px-2.5 py-1 rounded-xl bg-red-500/10 border border-red-500/25 text-[11px] font-bold text-red-500 cursor-pointer"
                             >
-                              رفع حظر {uid.slice(0, 8)}...
+                              رفع حظر {liveProfiles[uid]?.displayName || `${uid.slice(0, 8)}...`}
                             </button>
                           ))}
                         </div>
@@ -1995,6 +2193,16 @@ export function ChatRoomsView({
                           ))}
                         </div>
                       )}
+                      {currentUser && (
+                        <button
+                          type="button"
+                          onClick={() => setShowPersonalBgPicker(true)}
+                          className="w-full min-h-[38px] rounded-xl bg-white dark:bg-[#161B26] border border-slate-200 dark:border-[#242B38] text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center justify-center gap-2 cursor-pointer hover:border-[#3B6DFF]"
+                        >
+                          <Palette className="w-3.5 h-3.5 text-[#3B6DFF]" />
+                          <span>تخصيص خلفية الغرفة لي وحدي</span>
+                        </button>
+                      )}
                     </div>
 
                     {/* Global Room Appearance Editor (Owner / Moderator / Deputy with perm) */}
@@ -2020,11 +2228,44 @@ export function ChatRoomsView({
                           />
                         </div>
 
+                        <div className="space-y-1.5">
+                          <label className="block text-[11px] font-bold text-slate-500">معرض الخلفيات الاحترافية</label>
+                          <div className="grid grid-cols-3 sm:grid-cols-4 gap-1.5">
+                            {CHAT_BACKGROUND_PRESETS.map((preset) => {
+                              const active = !appBgImageURL && !appBgColor && appBgPresetId === preset.id;
+                              return (
+                                <button
+                                  key={preset.id}
+                                  type="button"
+                                  onClick={() => {
+                                    setAppBgPresetId(preset.id);
+                                    setAppBgImageURL('');
+                                    setAppBgColor('');
+                                  }}
+                                  className={`p-1.5 rounded-xl border text-start cursor-pointer ${
+                                    active
+                                      ? 'border-[#3B6DFF] bg-[#3B6DFF]/10'
+                                      : 'border-slate-200 dark:border-[#242B38] bg-slate-50 dark:bg-[#0B0F19]'
+                                  }`}
+                                >
+                                  <div
+                                    style={preset.previewStyle}
+                                    className="w-full h-9 rounded-lg mb-1 border border-white/10"
+                                  />
+                                  <span className="text-[10px] font-bold text-slate-700 dark:text-slate-200 block truncate">
+                                    {preset.name}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+
                         <div className="grid grid-cols-3 gap-2">
                           {[
                             { label: 'أيقونة الغرفة', field: 'imageURL' as const, val: appImageURL },
                             { label: 'غلاف الغرفة', field: 'coverURL' as const, val: appCoverURL },
-                            { label: 'خلفية الدردشة', field: 'bgImageURL' as const, val: appBgImageURL },
+                            { label: 'خلفية مخصصة', field: 'bgImageURL' as const, val: appBgImageURL },
                           ].map((item) => (
                             <label
                               key={item.field}
@@ -2047,13 +2288,28 @@ export function ChatRoomsView({
                         </div>
 
                         {appBgImageURL && (
-                          <button
-                            type="button"
-                            onClick={() => setAppBgImageURL('')}
-                            className="text-[11px] font-bold text-red-500 cursor-pointer"
-                          >
-                            إزالة صورة خلفية الدردشة
-                          </button>
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between text-[11px]">
+                              <span className="font-bold text-slate-500">تعتيم الخلفية لحماية وضوح النصوص</span>
+                              <span className="font-mono-subtle tabular-nums">{Math.round(appBgScrim * 100)}%</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0.25}
+                              max={0.85}
+                              step={0.05}
+                              value={appBgScrim}
+                              onChange={(e) => setAppBgScrim(Number(e.target.value))}
+                              className="w-full accent-[#3B6DFF]"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setAppBgImageURL('')}
+                              className="text-[11px] font-bold text-red-500 cursor-pointer"
+                            >
+                              إزالة صورة خلفية الدردشة
+                            </button>
+                          </div>
                         )}
 
                         <div className="space-y-1.5">
@@ -2326,9 +2582,7 @@ export function ChatRoomsView({
                   .filter(
                     (u) =>
                       u.id !== currentUser?.id &&
-                      (!inviteSearch.trim() ||
-                        u.displayName.toLowerCase().includes(inviteSearch.toLowerCase()) ||
-                        u.handle.toLowerCase().includes(inviteSearch.toLowerCase()))
+                      matchesSearchQuery(inviteSearch, u.displayName, u.handle)
                   )
                   .slice(0, 20)
                   .map((u) => {
@@ -2393,6 +2647,18 @@ export function ChatRoomsView({
             </div>
           </div>
         )}
+
+        {/* Personal Room Background Picker Modal */}
+        <ChatBackgroundPicker
+          isOpen={showPersonalBgPicker}
+          onClose={() => setShowPersonalBgPicker(false)}
+          title="تخصيص خلفية الغرفة لي وحدي"
+          currentPresetId={effectiveBgPresetId}
+          currentImageURL={effectiveBgImg}
+          uploadFolder="rooms"
+          onApply={handleSavePersonalRoomBg}
+          onResetToDefault={handleResetPersonalRoomBg}
+        />
 
         {/* Image Lightbox */}
         {lightboxUrl && (
@@ -2550,8 +2816,12 @@ export function ChatRoomsView({
                   <div className="flex items-center justify-between gap-2 mt-1.5 text-[11px] text-slate-500 dark:text-[#64748B]">
                     <span className="truncate">
                       {room.lastMessageText
-                        ? `${room.lastMessageSenderName || 'عضو'}: ${room.lastMessageText}`
-                        : `بقيادة ${room.ownerName}`}
+                        ? `${
+                            (room.lastMessageSenderId && liveProfiles[room.lastMessageSenderId]?.displayName) ||
+                            room.lastMessageSenderName ||
+                            'عضو'
+                          }: ${room.lastMessageText}`
+                        : `بقيادة ${getLiveRoomOwnerName(room)}`}
                     </span>
                     <span className="shrink-0 tabular-nums">
                       {formatRelativeTime(room.lastMessageAt || room.createdAt)}

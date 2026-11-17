@@ -9,6 +9,7 @@ import { VerifiedBadge } from '../common/VerifiedBadge';
 import { formatRelativeTime } from '../../utils/date';
 import { useToast } from '../../context/ToastContext';
 import { MediaImage } from '../common/MediaImage';
+import { useLiveUserProfile, useLiveUserProfiles } from '../../hooks/useUserProfiles';
 
 interface CommentsModalProps {
   post: Post;
@@ -26,6 +27,15 @@ export function CommentsModal({ post, isOpen, onClose, onSelectAuthor }: Comment
   const [commentText, setCommentText] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [canComment, setCanComment] = useState(true);
+
+  const livePostAuthor = useLiveUserProfile(post.authorId, {
+    displayName: post.authorName,
+    handle: post.authorHandle,
+    photoURL: post.authorPhotoURL,
+    isVerified: post.authorIsVerified,
+    verificationCategory: post.authorVerificationCategory,
+  });
+  const commentAuthorProfiles = useLiveUserProfiles(comments.map((c) => c.authorId));
 
   useEffect(() => {
     if (!isOpen) return;
@@ -118,7 +128,7 @@ export function CommentsModal({ post, isOpen, onClose, onSelectAuthor }: Comment
       <div className="space-y-4 font-tajawal">
         {/* Post Snippet */}
         <div className="p-3 rounded-xl bg-slate-100 dark:bg-[#0B0F19] border border-slate-200 dark:border-[#2A2F3A] text-xs text-slate-700 dark:text-slate-300">
-          <span className="font-bold text-slate-900 dark:text-white">{post.authorName}: </span>
+          <span className="font-bold text-slate-900 dark:text-white">{livePostAuthor.displayName}: </span>
           <span className="line-clamp-2">{post.content}</span>
         </div>
 
@@ -127,6 +137,11 @@ export function CommentsModal({ post, isOpen, onClose, onSelectAuthor }: Comment
           {comments.length > 0 ? (
             comments.map((comment) => {
               const canDelete = currentUser?.id === comment.authorId || isAdmin;
+              const liveCmtAuthor = commentAuthorProfiles[comment.authorId];
+              const cmtName = liveCmtAuthor?.displayName || comment.authorName;
+              const cmtPhoto = liveCmtAuthor ? liveCmtAuthor.photoURL : comment.authorPhotoURL;
+              const cmtVerified = liveCmtAuthor ? liveCmtAuthor.isVerified : Boolean(comment.authorIsVerified);
+              const cmtVerifiedCat = liveCmtAuthor ? liveCmtAuthor.verificationCategory : comment.authorVerificationCategory;
               return (
                 <div
                   key={comment.id}
@@ -144,10 +159,10 @@ export function CommentsModal({ post, isOpen, onClose, onSelectAuthor }: Comment
                       className="shrink-0 mt-0.5 cursor-pointer"
                     >
                       <MediaImage
-                        src={comment.authorPhotoURL}
-                        alt={comment.authorName}
+                        src={cmtPhoto}
+                        alt={cmtName}
                         variant="avatar"
-                        fallbackText={comment.authorName}
+                        fallbackText={cmtName}
                         containerClassName="w-8 h-8 rounded-full overflow-hidden border border-slate-200 dark:border-[#2A2F3A]"
                         className="w-full h-full object-cover"
                       />
@@ -164,11 +179,11 @@ export function CommentsModal({ post, isOpen, onClose, onSelectAuthor }: Comment
                           }}
                           className="text-xs font-bold text-slate-900 dark:text-white hover:text-[#3B6DFF] transition-colors cursor-pointer"
                         >
-                          {comment.authorName}
+                          {cmtName}
                         </button>
-                        {Boolean(comment.authorIsVerified) && (
+                        {cmtVerified && (
                           <VerifiedBadge
-                            category={comment.authorVerificationCategory || 'blue'}
+                            category={cmtVerifiedCat || 'blue'}
                             className="w-3.5 h-3.5"
                           />
                         )}

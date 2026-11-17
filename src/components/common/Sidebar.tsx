@@ -10,7 +10,8 @@ import {
   ShieldCheck,
   Plus,
   Award,
-  Bookmark
+  Bookmark,
+  Radio
 } from 'lucide-react';
 import { ActiveTab } from '../../types';
 import { useAuth } from '../../context/AuthContext';
@@ -30,6 +31,7 @@ export function Sidebar({ activeTab, setActiveTab, onOpenCreatePost }: SidebarPr
     { id: 'feed' as ActiveTab, label: t('home'), icon: Home },
     { id: 'explore' as ActiveTab, label: t('explore'), icon: Compass },
     { id: 'rooms' as ActiveTab, label: t('chatRooms'), icon: MessagesSquare },
+    { id: 'live' as ActiveTab, label: 'البث المباشر', icon: Radio },
     { id: 'events' as ActiveTab, label: t('events'), icon: Calendar },
     { id: 'messages' as ActiveTab, label: t('messages'), icon: MessageSquare },
     { id: 'notifications' as ActiveTab, label: t('notifications'), icon: Bell },

@@ -30,11 +30,9 @@ export function FeedView({ onOpenCreatePost, onSelectAuthor, onSelectPost }: Fee
       setPosts(loadedPosts);
       setLoading(false);
     });
-    const timer = setTimeout(() => setLoading(false), 1200);
 
     return () => {
       unsub();
-      clearTimeout(timer);
     };
   }, []);
 

@@ -19,7 +19,12 @@ import { XpLogEntry, computeLevelFromXp, xpRequiredForLevel } from '../../types'
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
-import { awardUserXp, listenToUserXpLogs } from '../../services/firestore';
+import {
+  XpStatusResponse,
+  awardUserXp,
+  fetchXpStatus,
+  listenToUserXpLogs
+} from '../../services/firestore';
 import { MediaImage } from '../common/MediaImage';
 
 interface LevelViewProps {
@@ -51,12 +56,15 @@ export function LevelView({ onBack }: LevelViewProps) {
   const [logs, setLogs] = useState<XpLogEntry[]>([]);
   const [loadingLogs, setLoadingLogs] = useState(true);
   const [claimingCheckin, setClaimingCheckin] = useState(false);
+  const [xpStatus, setXpStatus] = useState<XpStatusResponse | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   const BackIcon = isRTL ? ArrowRight : ArrowLeft;
 
   useEffect(() => {
     if (!currentUser?.id) {
       setLogs([]);
+      setXpStatus(null);
       setLoadingLogs(false);
       return;
     }
@@ -64,8 +72,19 @@ export function LevelView({ onBack }: LevelViewProps) {
       setLogs(items);
       setLoadingLogs(false);
     });
+    void fetchXpStatus().then((status) => {
+      if (status) setXpStatus(status);
+    });
     return () => unsub();
   }, [currentUser?.id]);
+
+  useEffect(() => {
+    if (!xpStatus?.checkedInToday) return;
+    const interval = setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [xpStatus?.checkedInToday]);
 
   if (!currentUser) {
     return (
@@ -89,16 +108,50 @@ export function LevelView({ onBack }: LevelViewProps) {
   const remaining = Math.max(0, nextXp - xp);
   const progressPct = Math.min(100, Math.max(3, Math.round((currentInLevel / span) * 100)));
 
+  const todayUtcDate = new Date().toISOString().slice(0, 10);
+  const isCheckedInToday = Boolean(
+    xpStatus?.checkedInToday || currentUser.lastDailyCheckinDate === todayUtcDate
+  );
+  const dailyXpCap = xpStatus?.dailyXpCap || 250;
+  const dailyXpEarned =
+    xpStatus?.dailyXpEarned ??
+    (currentUser.dailyXpDate === todayUtcDate ? currentUser.dailyXpEarned || 0 : 0);
+
+  const nextResetMs = xpStatus?.nextResetAt
+    ? new Date(xpStatus.nextResetAt).getTime()
+    : Date.UTC(
+        new Date().getUTCFullYear(),
+        new Date().getUTCMonth(),
+        new Date().getUTCDate() + 1,
+        0,
+        0,
+        0
+      );
+  const remainingSec = Math.max(0, Math.floor((nextResetMs - nowMs) / 1000));
+  const countdownText = [
+    Math.floor(remainingSec / 3600),
+    Math.floor((remainingSec % 3600) / 60),
+    remainingSec % 60,
+  ]
+    .map((n) => String(n).padStart(2, '0'))
+    .join(':');
+
   const handleDailyCheckin = async () => {
-    if (claimingCheckin) return;
+    if (claimingCheckin || isCheckedInToday) return;
     try {
       setClaimingCheckin(true);
       const res = await awardUserXp('daily_checkin');
+      const freshStatus = await fetchXpStatus();
+      if (freshStatus) setXpStatus(freshStatus);
       if (res?.awarded) {
         await refreshProfile();
         showToast(`تم تسجيل الحضور اليومي! حصلت على +${res.xpDelta} XP`, 'success');
+      } else if (res?.reason === 'already_checked_in_today') {
+        showToast('لقد حصلت على مكافأة الحضور اليومي بالفعل. يتجدد بعد منتصف الليل UTC.', 'info');
+      } else if (res?.reason === 'daily_cap_reached') {
+        showToast('وصلت إلى الحد اليومي لنقاط الخبرة (250 XP) لهذا اليوم UTC.', 'info');
       } else {
-        showToast('لقد حصلت على مكافأة الحضور اليومي بالفعل. عد غداً!', 'info');
+        showToast('تعذر تسجيل الحضور اليومي حالياً.', 'info');
       }
     } finally {
       setClaimingCheckin(false);
@@ -169,9 +222,14 @@ export function LevelView({ onBack }: LevelViewProps) {
             <p className="text-xs font-handle text-blue-100/80" dir="ltr">
               @{currentUser.handle}
             </p>
-            <div className="flex items-center gap-2 text-xs font-mono-subtle text-blue-100 pt-0.5 tabular-nums">
-              <Zap className="w-3.5 h-3.5 text-amber-300" />
-              <span>{xp.toLocaleString()} XP الإجمالي</span>
+            <div className="flex items-center gap-3 flex-wrap text-xs font-mono-subtle text-blue-100 pt-0.5 tabular-nums">
+              <span className="inline-flex items-center gap-1.5">
+                <Zap className="w-3.5 h-3.5 text-amber-300" />
+                <span>{xp.toLocaleString()} XP الإجمالي</span>
+              </span>
+              <span className="px-2 py-0.5 rounded-md bg-white/10 text-[10px] text-blue-100">
+                {dailyXpEarned} / {dailyXpCap} XP اليوم
+              </span>
             </div>
           </div>
         </div>
@@ -198,15 +256,25 @@ export function LevelView({ onBack }: LevelViewProps) {
         <button
           type="button"
           onClick={handleDailyCheckin}
-          disabled={claimingCheckin}
-          className="mt-4 w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-white text-[#0F172A] hover:bg-blue-50 font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-[0.98] cursor-pointer disabled:opacity-60"
+          disabled={claimingCheckin || isCheckedInToday}
+          className={`mt-4 w-full min-h-[44px] py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-[0.98] ${
+            isCheckedInToday
+              ? 'bg-white/15 text-blue-100 border border-white/25 cursor-not-allowed'
+              : 'bg-white text-[#0F172A] hover:bg-blue-50 cursor-pointer'
+          } disabled:opacity-80`}
         >
           {claimingCheckin ? (
             <Loader2 className="w-4 h-4 animate-spin text-[#3B6DFF]" />
+          ) : isCheckedInToday ? (
+            <CheckCircle2 className="w-4 h-4 text-emerald-300 shrink-0" />
           ) : (
-            <Sparkles className="w-4 h-4 text-[#3B6DFF]" />
+            <Sparkles className="w-4 h-4 text-[#3B6DFF] shrink-0" />
           )}
-          <span>تسجيل الحضور اليومي (+15 XP)</span>
+          <span className="tabular-nums">
+            {isCheckedInToday
+              ? `تم تسجيل الحضور اليوم — يتجدد خلال ${countdownText} (UTC)`
+              : 'تسجيل الحضور اليومي (+15 XP)'}
+          </span>
         </button>
       </div>
 
@@ -288,8 +356,14 @@ export function LevelView({ onBack }: LevelViewProps) {
                     <span>{new Date(entry.createdAt).toLocaleString()}</span>
                   </div>
                 </div>
-                <span className="text-xs font-mono-subtle font-bold text-emerald-600 dark:text-emerald-400 shrink-0 tabular-nums">
-                  +{entry.amount} XP
+                <span
+                  className={`text-xs font-mono-subtle font-bold shrink-0 tabular-nums ${
+                    entry.amount >= 0
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : 'text-rose-600 dark:text-rose-400'
+                  }`}
+                >
+                  {entry.amount >= 0 ? `+${entry.amount}` : entry.amount} XP
                 </span>
               </div>
             ))}

@@ -233,7 +233,8 @@ service cloud.firestore {
           !(existing().role in ['owner', 'admin']) &&
           incoming().diff(existing()).affectedKeys().hasOnly([
             'isRestricted', 'restrictedUntil', 'restrictionReason',
-            'isSuspended', 'suspensionReason', 'isBanned', 'bannedReason', 'warningCount'
+            'isSuspended', 'suspensionReason', 'isBanned', 'bannedReason', 'warningCount',
+            'xp', 'level'
           ])
         ) ||
         (
@@ -272,7 +273,8 @@ service cloud.firestore {
           !incoming().diff(existing()).affectedKeys().hasAny([
             'role', 'customRoleId', 'customRoleName', 'globalPermissions',
             'id', 'createdAt',
-            'xp', 'level', 'achievements', 'isSpecial', 'customTitle', 'customTitles',
+            'xp', 'level', 'dailyXpDate', 'dailyXpEarned', 'lastDailyCheckinDate', 'lastDailyCheckinAt', 'xpActionLastAt',
+            'achievements', 'isSpecial', 'customTitle', 'customTitles',
             'followersCount', 'followingCount', 'postsCount',
             'isVerified', 'verificationCategory', 'verificationStatus',
             'verifiedAt', 'verifiedBy', 'verifiedByName', 'verificationNote',
@@ -282,8 +284,23 @@ service cloud.firestore {
         ) ||
         (
           request.auth.uid == userId &&
-          incoming().diff(existing()).affectedKeys().hasOnly(['xp', 'level', 'lastActiveAt']) &&
-          validBoundedIncrement('xp', 0, 25) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'xp', 'level', 'lastActiveAt', 'dailyXpDate', 'dailyXpEarned',
+            'xpActionLastAt', 'lastDailyCheckinDate', 'lastDailyCheckinAt'
+          ]) &&
+          validBoundedIncrement('xp', 0, 20) &&
+          (!('dailyXpEarned' in incoming()) || (
+            incoming().dailyXpEarned is int &&
+            incoming().dailyXpEarned >= 0 &&
+            incoming().dailyXpEarned <= 250
+          )) &&
+          (!('dailyXpDate' in incoming()) || (
+            incoming().dailyXpDate is string &&
+            incoming().dailyXpDate.size() == 10
+          )) &&
+          (!incoming().diff(existing()).affectedKeys().hasAny(['lastDailyCheckinDate', 'lastDailyCheckinAt']) ||
+            exists(/databases/$(database)/documents/dailyCheckins/$(request.auth.uid + '_' + string(request.time.year()) + '_' + string(request.time.month()) + '_' + string(request.time.day())))
+          ) &&
           (!('level' in incoming()) || (
             incoming().level is int &&
             incoming().level >= 1 &&
@@ -645,7 +662,7 @@ service cloud.firestore {
         (
           !('bannedUserIds' in existing() && request.auth.uid in existing().bannedUserIds) &&
           incoming().diff(existing()).affectedKeys().hasOnly([
-            'memberCount', 'lastMessageText', 'lastMessageSenderName', 'lastMessageAt', 'updatedAt'
+            'memberCount', 'lastMessageText', 'lastMessageSenderId', 'lastMessageSenderName', 'lastMessageAt', 'updatedAt'
           ]) &&
           validCounterDelta('memberCount')
         )
@@ -745,11 +762,36 @@ service cloud.firestore {
     match /xpLogs/{logId} {
       allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
-      allow create: if isSignedIn() && isValidId(logId)
+      allow create: if isSignedIn() && isValidId(logId) && (
+        (
+          incoming().userId == request.auth.uid
+          && incoming().amount is number
+          && incoming().amount > 0
+          && incoming().amount <= 25
+        ) || (
+          (isAdmin() || hasGlobalPerm('manageUsers'))
+          && incoming().action == 'admin_adjust'
+          && incoming().amount is number
+        )
+      );
+      allow update, delete: if false;
+    }
+
+    // Deterministic Once-Per-UTC-Day Daily Check-In Claims
+    match /dailyCheckins/{checkinId} {
+      allow get: if isSignedIn() && isValidId(checkinId) && (
+        resource.data.userId == request.auth.uid || isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        isAdmin() || resource.data.userId == request.auth.uid
+      );
+      allow create: if isSignedIn() && isValidId(checkinId)
+        && checkinId == (request.auth.uid + '_' + string(request.time.year()) + '_' + string(request.time.month()) + '_' + string(request.time.day()))
+        && incoming().id == checkinId
         && incoming().userId == request.auth.uid
-        && incoming().amount is number
-        && incoming().amount > 0
-        && incoming().amount <= 25;
+        && incoming().amount == 15
+        && incoming().dateKey is string && incoming().dateKey.size() == 10
+        && incoming().createdAt is string;
       allow update, delete: if false;
     }
 
@@ -783,12 +825,135 @@ service cloud.firestore {
     // Administrative & Moderation Audit Logs
     match /audit_logs/{logId} {
       allow get, list: if isModerator() || hasGlobalPerm('viewAuditLogs');
-      allow create: if isModerator() && isValidId(logId)
+      allow create: if isSignedIn() && isValidId(logId)
+        && (isModerator() || hasGlobalPerm('manageUsers') || hasGlobalPerm('manageRooms') || hasGlobalPerm('manageStickers') || hasGlobalPerm('manageLive'))
         && incoming().actorId == request.auth.uid
         && incoming().actionType is string && incoming().actionType.size() <= 50
         && incoming().targetId is string && incoming().targetId.size() <= 128
         && incoming().createdAt is string;
       allow update, delete: if false;
+    }
+
+    // WhatsApp-style Sticker Packs with Moderation Lifecycle
+    match /stickerPacks/{packId} {
+      allow get: if isValidId(packId) && (
+        (resource.data.status == 'approved' && resource.data.isEnabled == true) ||
+        (isSignedIn() && (
+          resource.data.authorId == request.auth.uid ||
+          isAdmin() ||
+          isSeniorStaff() ||
+          hasGlobalPerm('manageStickers')
+        ))
+      );
+      allow list: if (resource.data.status == 'approved' && resource.data.isEnabled == true) || (
+        isSignedIn() && (
+          resource.data.authorId == request.auth.uid ||
+          isAdmin() ||
+          isSeniorStaff() ||
+          hasGlobalPerm('manageStickers')
+        )
+      );
+      allow create: if isSignedIn() && isValidId(packId)
+        && incoming().id == packId
+        && incoming().authorId == request.auth.uid
+        && incoming().title is string && incoming().title.size() >= 2 && incoming().title.size() <= 60
+        && incoming().stickers is list && incoming().stickers.size() >= 1 && incoming().stickers.size() <= 30
+        && (
+          incoming().status == 'pending' ||
+          ((isAdmin() || isSeniorStaff() || hasGlobalPerm('manageStickers')) && incoming().status == 'approved')
+        );
+      allow update: if isSignedIn() && isValidId(packId) && (
+        isAdmin() ||
+        isSeniorStaff() ||
+        hasGlobalPerm('manageStickers') ||
+        (
+          existing().status == 'approved' &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['installsCount']) &&
+          validCounterDelta('installsCount')
+        )
+      );
+      allow delete: if isSignedIn() && isValidId(packId) && (
+        isAdmin() ||
+        isSeniorStaff() ||
+        hasGlobalPerm('manageStickers') ||
+        (existing().authorId == request.auth.uid && existing().status in ['pending', 'rejected'])
+      );
+    }
+
+    // Live Broadcast System (Real Sync, Live Chat, Reactions, Viewer Presence, WebRTC Signals)
+    match /liveBroadcasts/{broadcastId} {
+      allow get, list: if true;
+      allow create: if isSignedIn() && isValidId(broadcastId)
+        && incoming().id == broadcastId
+        && incoming().hostId == request.auth.uid
+        && incoming().title is string && incoming().title.size() >= 2 && incoming().title.size() <= 120
+        && incoming().mode in ['youtube_embed', 'external_stream', 'camera_webrtc']
+        && incoming().status == 'live';
+      allow update: if isSignedIn() && isValidId(broadcastId) && (
+        existing().hostId == request.auth.uid ||
+        isAdmin() ||
+        isSeniorStaff() ||
+        hasGlobalPerm('manageLive') ||
+        (
+          !('bannedUserIds' in existing() && request.auth.uid in existing().bannedUserIds) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['viewerCount', 'updatedAt']) &&
+          validCounterDelta('viewerCount')
+        )
+      );
+      allow delete: if isSignedIn() && isValidId(broadcastId) && (
+        existing().hostId == request.auth.uid ||
+        isAdmin() ||
+        hasGlobalPerm('manageLive')
+      );
+
+      match /messages/{msgId} {
+        allow get, list: if true;
+        allow create: if isSignedIn() && isValidId(msgId)
+          && incoming().senderId == request.auth.uid
+          && incoming().text is string && incoming().text.size() > 0 && incoming().text.size() <= 500
+          && get(/databases/$(database)/documents/liveBroadcasts/$(broadcastId)).data.status == 'live'
+          && get(/databases/$(database)/documents/liveBroadcasts/$(broadcastId)).data.isChatEnabled == true
+          && !(request.auth.uid in get(/databases/$(database)/documents/liveBroadcasts/$(broadcastId)).data.bannedUserIds)
+          && !(request.auth.uid in get(/databases/$(database)/documents/liveBroadcasts/$(broadcastId)).data.mutedUserIds);
+        allow delete: if isSignedIn() && isValidId(msgId) && (
+          resource.data.senderId == request.auth.uid ||
+          get(/databases/$(database)/documents/liveBroadcasts/$(broadcastId)).data.hostId == request.auth.uid ||
+          isAdmin() ||
+          hasGlobalPerm('manageLive')
+        );
+      }
+
+      match /reactions/{reactionId} {
+        allow get, list: if true;
+        allow create: if isSignedIn() && isValidId(reactionId)
+          && incoming().userId == request.auth.uid
+          && !(request.auth.uid in get(/databases/$(database)/documents/liveBroadcasts/$(broadcastId)).data.bannedUserIds);
+      }
+
+      match /viewers/{viewerId} {
+        allow get, list: if true;
+        allow create, update: if isSignedIn() && isValidId(viewerId) && request.auth.uid == viewerId
+          && !(request.auth.uid in get(/databases/$(database)/documents/liveBroadcasts/$(broadcastId)).data.bannedUserIds);
+        allow delete: if isSignedIn() && isValidId(viewerId) && (
+          request.auth.uid == viewerId ||
+          get(/databases/$(database)/documents/liveBroadcasts/$(broadcastId)).data.hostId == request.auth.uid ||
+          isAdmin() ||
+          hasGlobalPerm('manageLive')
+        );
+      }
+
+      match /signals/{signalId} {
+        allow get, list: if isSignedIn();
+        allow create: if isSignedIn() && isValidId(signalId)
+          && incoming().fromUserId == request.auth.uid
+          && !(request.auth.uid in get(/databases/$(database)/documents/liveBroadcasts/$(broadcastId)).data.bannedUserIds);
+        allow delete: if isSignedIn() && isValidId(signalId) && (
+          resource.data.fromUserId == request.auth.uid ||
+          resource.data.toUserId == request.auth.uid ||
+          get(/databases/$(database)/documents/liveBroadcasts/$(broadcastId)).data.hostId == request.auth.uid ||
+          isAdmin()
+        );
+      }
     }
 
     // Moderation Appeals Collection

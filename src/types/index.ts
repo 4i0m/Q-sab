@@ -65,6 +65,8 @@ export type GlobalPermissionKey =
   | 'manageVerifications'
   | 'manageRooms'
   | 'manageWiki'
+  | 'manageStickers'
+  | 'manageLive'
   | 'viewAuditLogs';
 
 export interface GlobalAdminRole {
@@ -94,6 +96,7 @@ export interface UserCustomization {
     comments?: boolean;
     follows?: boolean;
     messages?: boolean;
+    showMessagePreview?: boolean;
     announcements?: boolean;
     sound?: boolean;
   };
@@ -102,7 +105,13 @@ export interface UserCustomization {
     bubbleTheme?: 'classic' | 'glass' | 'minimal' | 'gold';
     accentColor?: string;
     compactMode?: boolean;
+    defaultDmBgPresetId?: string;
+    defaultDmBgImageURL?: string;
+    dmBackgrounds?: Record<string, { presetId?: string; imageURL?: string }>;
+    roomBackgroundOverrides?: Record<string, { presetId?: string; imageURL?: string }>;
   };
+  savedStickerPackIds?: string[];
+  recentStickers?: Array<{ packId: string; stickerId: string; url: string; label?: string }>;
 }
 
 export interface UserProfile {
@@ -127,6 +136,11 @@ export interface UserProfile {
   verifiedByName?: string;
   level: number;
   xp: number;
+  dailyXpDate?: string;
+  dailyXpEarned?: number;
+  lastDailyCheckinDate?: string;
+  lastDailyCheckinAt?: string;
+  xpActionLastAt?: Record<string, string>;
   customTitle?: CustomTitle | null;
   customTitles?: CustomTitle[];
   isSpecial?: boolean;
@@ -283,6 +297,7 @@ export interface Message {
   audioDurationSec?: number;
   stickerId?: string;
   stickerUrl?: string;
+  stickerPackId?: string;
   replyTo?: {
     id: string;
     senderName: string;
@@ -408,7 +423,9 @@ export interface RoomPermissions {
 
 export interface ChatRoomAppearance {
   bgColor?: string;
+  bgPresetId?: string;
   bgImageURL?: string;
+  bgScrimOpacity?: number;
   accentColor?: string;
   bubbleTheme?: 'classic' | 'glass' | 'minimal' | 'gold';
 }
@@ -435,6 +452,7 @@ export interface ChatRoom {
   isReadOnly?: boolean;
   memberCount: number;
   lastMessageText?: string;
+  lastMessageSenderId?: string;
   lastMessageSenderName?: string;
   lastMessageAt?: string;
   createdAt: string;
@@ -470,12 +488,16 @@ export interface ChatRoomMessage {
   senderRoomRole?: ChatRoomMember['role'];
   senderCustomTitle?: CustomTitle | null;
   senderCustomTitles?: CustomTitle[];
+  messageType?: 'text' | 'image' | 'video' | 'audio' | 'sticker';
   text: string;
   mediaURL?: string;
   mediaType?: 'image' | 'video';
   mediaMetadata?: MediaMetadata;
   audioURL?: string;
   audioDurationSec?: number;
+  stickerId?: string;
+  stickerUrl?: string;
+  stickerPackId?: string;
   replyTo?: {
     id: string;
     senderName: string;
@@ -554,7 +576,17 @@ export interface PlatformAd {
 export interface XpLogEntry {
   id: string;
   userId: string;
-  action: 'post_create' | 'comment_create' | 'repost_create' | 'like_given' | 'daily_checkin' | 'event_join' | 'room_message';
+  action:
+    | 'post_create'
+    | 'comment_create'
+    | 'repost_create'
+    | 'like_given'
+    | 'daily_checkin'
+    | 'event_join'
+    | 'room_message'
+    | 'live_watch'
+    | 'live_host'
+    | 'admin_adjust';
   amount: number;
   label: string;
   createdAt: string;
@@ -648,11 +680,120 @@ export interface AuditLog {
     | 'post_delete'
     | 'post_restore'
     | 'report_resolve'
-    | 'appeal_decide';
-  targetType: 'user' | 'post' | 'report' | 'verification' | 'appeal' | 'room' | 'event' | 'title' | 'role' | 'announcement' | 'ad';
+    | 'appeal_decide'
+    | 'xp_adjust'
+    | 'room_delete'
+    | 'sticker_approve'
+    | 'sticker_reject'
+    | 'sticker_disable'
+    | 'sticker_enable'
+    | 'sticker_delete'
+    | 'live_start'
+    | 'live_end';
+  targetType:
+    | 'user'
+    | 'post'
+    | 'report'
+    | 'verification'
+    | 'appeal'
+    | 'room'
+    | 'event'
+    | 'title'
+    | 'role'
+    | 'announcement'
+    | 'ad'
+    | 'sticker_pack'
+    | 'live_broadcast';
   targetId: string;
   targetDetails?: string;
   reason?: string;
+  createdAt: string;
+}
+
+export interface StickerItem {
+  id: string;
+  url: string;
+  label?: string;
+  storagePath?: string;
+  contentType?: string;
+  sizeBytes?: number;
+}
+
+export type StickerPackStatus = 'pending' | 'approved' | 'rejected' | 'disabled';
+
+export interface StickerPack {
+  id: string;
+  title: string;
+  description?: string;
+  coverURL: string;
+  authorId: string;
+  authorName: string;
+  status: StickerPackStatus;
+  isEnabled: boolean;
+  moderationNote?: string;
+  reviewedBy?: string;
+  reviewedByName?: string;
+  reviewedAt?: string;
+  stickers: StickerItem[];
+  installsCount: number;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export type LiveBroadcastMode = 'youtube_embed' | 'external_stream' | 'camera_webrtc';
+export type LiveBroadcastStatus = 'live' | 'ended';
+export type LivePlaybackState = 'playing' | 'paused';
+
+export interface LiveBroadcast {
+  id: string;
+  title: string;
+  description?: string;
+  coverURL?: string;
+  mode: LiveBroadcastMode;
+  sourceUrl?: string;
+  youtubeVideoId?: string;
+  roomId?: string;
+  hostId: string;
+  hostName: string;
+  hostPhotoURL?: string;
+  status: LiveBroadcastStatus;
+  playbackState: LivePlaybackState;
+  playbackPositionSec: number;
+  playbackUpdatedAt: string;
+  isChatEnabled: boolean;
+  mutedUserIds: string[];
+  bannedUserIds: string[];
+  viewerCount: number;
+  startedAt: string;
+  endedAt?: string;
+  updatedAt: string;
+}
+
+export interface LiveBroadcastMessage {
+  id: string;
+  broadcastId: string;
+  senderId: string;
+  senderName: string;
+  senderPhotoURL?: string;
+  text: string;
+  createdAt: string;
+}
+
+export interface LiveBroadcastReaction {
+  id: string;
+  broadcastId: string;
+  userId: string;
+  emoji: string;
+  createdAt: string;
+}
+
+export interface LiveBroadcastSignal {
+  id: string;
+  broadcastId: string;
+  fromUserId: string;
+  toUserId: string;
+  type: 'offer' | 'answer' | 'ice';
+  payload: string;
   createdAt: string;
 }
 
@@ -683,6 +824,7 @@ export type ActiveTab =
   | 'feed'
   | 'explore'
   | 'rooms'
+  | 'live'
   | 'events'
   | 'messages'
   | 'notifications'

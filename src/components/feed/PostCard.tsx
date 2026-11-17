@@ -22,7 +22,7 @@ import {
   X,
   Users
 } from 'lucide-react';
-import { Post, getSortedUserTitles } from '../../types';
+import { Post } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
 import {
@@ -40,11 +40,12 @@ import {
 } from '../../services/firestore';
 import { useToast } from '../../context/ToastContext';
 import { useClickOutside } from '../../hooks/useClickOutside';
-import { VerifiedBadge, LevelBadge, CustomTitleBadge } from '../common/VerifiedBadge';
+import { VerifiedBadge, LevelBadge } from '../common/VerifiedBadge';
 import { CommentsModal } from './CommentsModal';
 import { formatRelativeTime } from '../../utils/date';
 import { stripMarkdownForPreview, estimateReadingMinutes } from '../common/RichBlogContent';
 import { MediaImage } from '../common/MediaImage';
+import { useLiveUserProfile } from '../../hooks/useUserProfiles';
 
 interface PostCardProps {
   post: Post;
@@ -56,6 +57,24 @@ export function PostCard({ post, onSelectAuthor, onSelectPost }: PostCardProps) 
   const { currentUser, isAdmin, refreshProfile } = useAuth();
   const { language } = useLanguage();
   const { showToast } = useToast();
+
+  const liveAuthor = useLiveUserProfile(post.authorId, {
+    displayName: post.authorName,
+    handle: post.authorHandle,
+    photoURL: post.authorPhotoURL,
+    role: post.authorRole,
+    isVerified: post.authorIsVerified,
+    verificationCategory: post.authorVerificationCategory,
+    level: post.authorLevel,
+  });
+
+  const liveRepostAuthor = useLiveUserProfile(post.repostOf?.authorId, post.repostOf ? {
+    displayName: post.repostOf.authorName,
+    handle: post.repostOf.authorHandle,
+    photoURL: post.repostOf.authorPhotoURL,
+    isVerified: post.repostOf.authorIsVerified,
+    verificationCategory: post.repostOf.authorVerificationCategory,
+  } : undefined);
 
   const [isLiked, setIsLiked] = useState(false);
   const [likesCount, setLikesCount] = useState(post.likesCount || 0);
@@ -168,8 +187,8 @@ export function PostCard({ post, onSelectAuthor, onSelectPost }: PostCardProps) 
       setIsBookmarkLoading(true);
       const newStatus = await toggleBookmark(currentUser.id, post.id, {
         content: post.content,
-        authorName: post.authorName,
-        authorHandle: post.authorHandle,
+        authorName: liveAuthor.displayName,
+        authorHandle: liveAuthor.handle,
         mediaURL: post.mediaURL,
       });
       setIsBookmarked(newStatus);
@@ -188,7 +207,7 @@ export function PostCard({ post, onSelectAuthor, onSelectPost }: PostCardProps) 
     if (navigator.share) {
       try {
         await navigator.share({
-          title: `${post.authorName} · Q`,
+          title: `${liveAuthor.displayName} · Q`,
           text: post.content || post.title || '',
           url: window.location.href,
         });
@@ -294,7 +313,7 @@ export function PostCard({ post, onSelectAuthor, onSelectPost }: PostCardProps) 
         {post.postType === 'repost' && (
           <div className="flex items-center gap-1.5 text-[11px] font-bold text-emerald-600 dark:text-emerald-400 mb-2">
             <Repeat2 className="w-3.5 h-3.5" />
-            <span>أعاد {post.authorName} النشر</span>
+            <span>أعاد {liveAuthor.displayName} النشر</span>
           </div>
         )}
 
@@ -305,10 +324,10 @@ export function PostCard({ post, onSelectAuthor, onSelectPost }: PostCardProps) 
             className="flex items-center gap-2.5 cursor-pointer group min-w-0"
           >
             <MediaImage
-              src={post.authorPhotoURL}
-              alt={post.authorName}
+              src={liveAuthor.photoURL}
+              alt={liveAuthor.displayName}
               variant="avatar"
-              fallbackText={post.authorName}
+              fallbackText={liveAuthor.displayName}
               containerClassName="w-10 h-10 rounded-full overflow-hidden border border-slate-200 dark:border-[#2A3242] shrink-0"
               className="w-full h-full rounded-full object-cover"
             />
@@ -316,26 +335,18 @@ export function PostCard({ post, onSelectAuthor, onSelectPost }: PostCardProps) 
             <div className="min-w-0">
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="font-display-en text-[15px] font-bold text-slate-900 dark:text-white group-hover:text-[#3B6DFF] dark:group-hover:text-[#60A5FA] transition-colors truncate">
-                  {post.authorName}
+                  {liveAuthor.displayName}
                 </span>
-                {Boolean(post.authorIsVerified) && (
-                  <VerifiedBadge category={post.authorVerificationCategory || 'blue'} className="w-4 h-4" />
+                {Boolean(liveAuthor.isVerified) && (
+                  <VerifiedBadge category={liveAuthor.verificationCategory || 'blue'} className="w-4 h-4" />
                 )}
-                {getSortedUserTitles({
-                  customTitle: post.authorCustomTitle,
-                  customTitles: post.authorCustomTitles,
-                })
-                  .slice(0, 3)
-                  .map((titleItem, tIdx) => (
-                    <CustomTitleBadge key={titleItem.id || `${titleItem.text}_${tIdx}`} title={titleItem} compact />
-                  ))}
-                {Boolean(post.authorLevel && post.authorLevel > 0) && (
-                  <LevelBadge level={post.authorLevel!} />
+                {Boolean(liveAuthor.level && liveAuthor.level > 0) && (
+                  <LevelBadge level={liveAuthor.level} />
                 )}
               </div>
 
               <div className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-[#8E9BAB] mt-0.5 flex-wrap">
-                <span className="font-handle">@{post.authorHandle || 'user'}</span>
+                <span className="font-handle">@{liveAuthor.handle || 'user'}</span>
                 <span>·</span>
                 <span className="tabular-nums">{formatRelativeTime(post.createdAt)}</span>
                 {post.visibility === 'followers_only' && (
@@ -531,25 +542,25 @@ export function PostCard({ post, onSelectAuthor, onSelectPost }: PostCardProps) 
               >
                 <div className="flex items-center gap-2 min-w-0">
                   <MediaImage
-                    src={post.repostOf.authorPhotoURL}
-                    alt={post.repostOf.authorName}
+                    src={liveRepostAuthor.photoURL}
+                    alt={liveRepostAuthor.displayName}
                     variant="avatar"
-                    fallbackText={post.repostOf.authorName}
+                    fallbackText={liveRepostAuthor.displayName}
                     containerClassName="w-6 h-6 rounded-full overflow-hidden shrink-0"
                     className="w-full h-full object-cover"
                   />
                   <span className="text-xs font-bold text-slate-900 dark:text-white truncate">
-                    {post.repostOf.authorName}
+                    {liveRepostAuthor.displayName}
                   </span>
-                  {post.repostOf.authorIsVerified && (
+                  {liveRepostAuthor.isVerified && (
                     <VerifiedBadge
-                      category={post.repostOf.authorVerificationCategory || 'blue'}
+                      category={liveRepostAuthor.verificationCategory || 'blue'}
                       className="w-3.5 h-3.5"
                       interactive={false}
                     />
                   )}
                   <span className="font-handle text-[11px] text-slate-400 truncate">
-                    @{post.repostOf.authorHandle}
+                    @{liveRepostAuthor.handle}
                   </span>
                 </div>
                 {post.repostOf.title && (

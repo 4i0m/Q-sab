@@ -21,7 +21,7 @@ import {
   Edit3,
   Users
 } from 'lucide-react';
-import { Post, Comment, getSortedUserTitles } from '../../types';
+import { Post, Comment } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { useToast } from '../../context/ToastContext';
@@ -44,10 +44,11 @@ import {
   repostPost,
   updateWikiPost
 } from '../../services/firestore';
-import { VerifiedBadge, LevelBadge, CustomTitleBadge, RoleBadge } from '../common/VerifiedBadge';
+import { VerifiedBadge, LevelBadge, RoleBadge } from '../common/VerifiedBadge';
 import { formatRelativeTime } from '../../utils/date';
 import { RichBlogContent, RichBlogEditor, estimateReadingMinutes } from '../common/RichBlogContent';
 import { MediaImage } from '../common/MediaImage';
+import { useLiveUserProfile, useLiveUserProfiles } from '../../hooks/useUserProfiles';
 
 interface PostDetailViewProps {
   post: Post;
@@ -62,6 +63,26 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
 
   const [post, setPost] = useState<Post>(initialPost);
   const [comments, setComments] = useState<Comment[]>([]);
+
+  const liveAuthor = useLiveUserProfile(post.authorId, {
+    displayName: post.authorName,
+    handle: post.authorHandle,
+    photoURL: post.authorPhotoURL,
+    role: post.authorRole,
+    isVerified: post.authorIsVerified,
+    verificationCategory: post.authorVerificationCategory,
+    level: post.authorLevel,
+  });
+
+  const liveRepostAuthor = useLiveUserProfile(post.repostOf?.authorId, post.repostOf ? {
+    displayName: post.repostOf.authorName,
+    handle: post.repostOf.authorHandle,
+    photoURL: post.repostOf.authorPhotoURL,
+    isVerified: post.repostOf.authorIsVerified,
+    verificationCategory: post.repostOf.authorVerificationCategory,
+  } : undefined);
+
+  const commentAuthorProfiles = useLiveUserProfiles(comments.map((c) => c.authorId));
   const [loadingComments, setLoadingComments] = useState(true);
   const [commentText, setCommentText] = useState('');
   const [replyingTo, setReplyingTo] = useState<Comment | null>(null);
@@ -217,8 +238,8 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
     try {
       const next = await toggleBookmark(currentUser.id, post.id, {
         content: post.content,
-        authorName: post.authorName,
-        authorHandle: post.authorHandle,
+        authorName: liveAuthor.displayName,
+        authorHandle: liveAuthor.handle,
         mediaURL: gallery[0],
       });
       setIsBookmarked(next);
@@ -232,7 +253,7 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
     try {
       if (navigator.share) {
         await navigator.share({
-          title: post.title || post.authorName,
+          title: post.title || liveAuthor.displayName,
           text: post.content,
           url: window.location.href,
         });
@@ -431,36 +452,30 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
           className="flex items-center gap-3 cursor-pointer"
         >
           <MediaImage
-            src={post.authorPhotoURL}
-            alt={post.authorName}
+            src={liveAuthor.photoURL}
+            alt={liveAuthor.displayName}
             variant="avatar"
-            fallbackText={post.authorName}
+            fallbackText={liveAuthor.displayName}
             containerClassName="w-11 h-11 rounded-full overflow-hidden border border-slate-200 dark:border-[#2A3242] shrink-0"
             className="w-full h-full object-cover"
           />
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-1.5 flex-wrap">
               <span className="font-display-en text-[15px] font-bold text-slate-900 dark:text-white truncate">
-                {post.authorName}
+                {liveAuthor.displayName}
               </span>
-              {Boolean(post.authorIsVerified) && (
-                <VerifiedBadge category={post.authorVerificationCategory || 'blue'} />
+              {Boolean(liveAuthor.isVerified) && (
+                <VerifiedBadge category={liveAuthor.verificationCategory || 'blue'} />
               )}
-              {post.authorRole && post.authorRole !== 'user' && (
-                <RoleBadge role={post.authorRole} />
+              {liveAuthor.role && liveAuthor.role !== 'user' && (
+                <RoleBadge role={liveAuthor.role} />
               )}
-              {getSortedUserTitles({
-                customTitle: post.authorCustomTitle,
-                customTitles: post.authorCustomTitles,
-              }).map((titleItem, tIdx) => (
-                <CustomTitleBadge key={titleItem.id || `${titleItem.text}_${tIdx}`} title={titleItem} compact />
-              ))}
-              {Boolean(post.authorLevel && post.authorLevel > 0) && (
-                <LevelBadge level={post.authorLevel!} />
+              {Boolean(liveAuthor.level && liveAuthor.level > 0) && (
+                <LevelBadge level={liveAuthor.level} />
               )}
             </div>
             <div className="text-xs text-slate-500 dark:text-[#8E9BAB] flex items-center gap-1.5 flex-wrap mt-0.5">
-              <span className="font-handle">@{post.authorHandle}</span>
+              <span className="font-handle">@{liveAuthor.handle}</span>
               <span>·</span>
               <span className="tabular-nums">{formatRelativeTime(post.createdAt)}</span>
               {post.visibility === 'followers_only' && (
@@ -517,18 +532,18 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
           <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-[#0B0F19] border border-slate-200 dark:border-[#242B38] space-y-2">
             <div className="flex items-center gap-2">
               <MediaImage
-                src={post.repostOf.authorPhotoURL}
-                alt={post.repostOf.authorName}
+                src={liveRepostAuthor.photoURL}
+                alt={liveRepostAuthor.displayName}
                 variant="avatar"
-                fallbackText={post.repostOf.authorName}
+                fallbackText={liveRepostAuthor.displayName}
                 containerClassName="w-6 h-6 rounded-full overflow-hidden shrink-0"
                 className="w-full h-full object-cover"
               />
               <span className="text-xs font-bold text-slate-900 dark:text-white">
-                {post.repostOf.authorName}
+                {liveRepostAuthor.displayName}
               </span>
               <span className="font-handle text-[11px] text-slate-400">
-                @{post.repostOf.authorHandle}
+                @{liveRepostAuthor.handle}
               </span>
             </div>
             {post.repostOf.content && (
@@ -549,10 +564,17 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
         {gallery.length > 0 && (
           <div className={`grid gap-2 ${gallery.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
             {gallery.map((imgUrl, idx) => (
-              <button
+              <div
                 key={idx}
-                type="button"
+                role="button"
+                tabIndex={0}
                 onClick={() => setLightboxImage(imgUrl)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setLightboxImage(imgUrl);
+                  }
+                }}
                 className="relative rounded-2xl overflow-hidden bg-slate-100 dark:bg-[#141A26] border border-slate-200 dark:border-[#242B38] cursor-pointer"
               >
                 <MediaImage
@@ -562,7 +584,7 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
                   containerClassName="w-full h-64 sm:h-80 overflow-hidden"
                   className="w-full h-full object-cover"
                 />
-              </button>
+              </div>
             ))}
           </div>
         )}
@@ -746,6 +768,12 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
               const isBest = post.bestAnswerCommentId === cmt.id || cmt.isBestAnswer;
               const childReplies = repliesByParent[cmt.id] || [];
               const canDeleteCmt = currentUser?.id === cmt.authorId || isAdmin;
+              const cmtAuthor = commentAuthorProfiles[cmt.authorId];
+              const cmtName = cmtAuthor?.displayName || cmt.authorName;
+              const cmtHandle = cmtAuthor?.handle || cmt.authorHandle;
+              const cmtPhoto = cmtAuthor ? cmtAuthor.photoURL : cmt.authorPhotoURL;
+              const cmtVerified = cmtAuthor ? cmtAuthor.isVerified : Boolean(cmt.authorIsVerified);
+              const cmtVerifiedCat = cmtAuthor ? cmtAuthor.verificationCategory : cmt.authorVerificationCategory;
               return (
                 <div
                   key={cmt.id}
@@ -768,10 +796,10 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
                       className="cursor-pointer shrink-0"
                     >
                       <MediaImage
-                        src={cmt.authorPhotoURL}
-                        alt={cmt.authorName}
+                        src={cmtPhoto}
+                        alt={cmtName}
                         variant="avatar"
-                        fallbackText={cmt.authorName}
+                        fallbackText={cmtName}
                         containerClassName="w-8 h-8 rounded-full overflow-hidden"
                         className="w-full h-full object-cover"
                       />
@@ -783,13 +811,13 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
                             onClick={() => onSelectAuthor(cmt.authorId)}
                             className="text-xs font-bold text-slate-900 dark:text-white cursor-pointer truncate"
                           >
-                            {cmt.authorName}
+                            {cmtName}
                           </span>
-                          {Boolean(cmt.authorIsVerified) && (
-                            <VerifiedBadge category={cmt.authorVerificationCategory || 'blue'} className="w-3 h-3" />
+                          {cmtVerified && (
+                            <VerifiedBadge category={cmtVerifiedCat || 'blue'} className="w-3 h-3" />
                           )}
                           <span className="font-handle text-[11px] text-slate-400">
-                            @{cmt.authorHandle}
+                            @{cmtHandle}
                           </span>
                           <span className="text-[10px] text-slate-400">
                             {formatRelativeTime(cmt.createdAt)}
@@ -838,17 +866,21 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
                   {/* Nested Replies */}
                   {childReplies.length > 0 && (
                     <div className="ms-7 ps-3 border-s-2 border-slate-200 dark:border-[#242B38] space-y-2 pt-1">
-                      {childReplies.map((reply) => (
+                      {childReplies.map((reply) => {
+                        const replyAuthor = commentAuthorProfiles[reply.authorId];
+                        const replyName = replyAuthor?.displayName || reply.authorName;
+                        const replyPhoto = replyAuthor ? replyAuthor.photoURL : reply.authorPhotoURL;
+                        return (
                         <div key={reply.id} className="flex items-start gap-2">
                           <div
                             onClick={() => onSelectAuthor(reply.authorId)}
                             className="cursor-pointer shrink-0"
                           >
                             <MediaImage
-                              src={reply.authorPhotoURL}
-                              alt={reply.authorName}
+                              src={replyPhoto}
+                              alt={replyName}
                               variant="avatar"
-                              fallbackText={reply.authorName}
+                              fallbackText={replyName}
                               containerClassName="w-6 h-6 rounded-full overflow-hidden"
                               className="w-full h-full object-cover"
                             />
@@ -859,7 +891,7 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
                                 onClick={() => onSelectAuthor(reply.authorId)}
                                 className="text-[11px] font-bold text-slate-900 dark:text-white cursor-pointer"
                               >
-                                {reply.authorName}
+                                {replyName}
                               </span>
                               {(currentUser?.id === reply.authorId || isAdmin) && (
                                 <button
@@ -881,7 +913,8 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
                             </p>
                           </div>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -900,7 +933,7 @@ export function PostDetailView({ post: initialPost, onBack, onSelectAuthor }: Po
           {replyingTo && (
             <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-[#3B6DFF]/10 text-xs text-[#3B6DFF]">
               <span>
-                الرد على <strong>{replyingTo.authorName}</strong>
+                الرد على <strong>{commentAuthorProfiles[replyingTo.authorId]?.displayName || replyingTo.authorName}</strong>
               </span>
               <button type="button" onClick={() => setReplyingTo(null)} className="cursor-pointer">
                 <X className="w-3.5 h-3.5" />

@@ -7,9 +7,24 @@ interface SplashScreenProps {
   duration?: number;
 }
 
-export function SplashScreen({ onDismiss, onOpenAuth, duration = 3000 }: SplashScreenProps) {
+export function SplashScreen({ onDismiss, onOpenAuth, duration = 2200 }: SplashScreenProps) {
   const [isVisible, setIsVisible] = useState(true);
   const [isFading, setIsFading] = useState(false);
+
+  useEffect(() => {
+    if (!duration || duration <= 0) return;
+    const fadeTimer = setTimeout(() => {
+      setIsFading(true);
+    }, duration);
+    const hideTimer = setTimeout(() => {
+      setIsVisible(false);
+      onDismiss?.();
+    }, duration + 250);
+    return () => {
+      clearTimeout(fadeTimer);
+      clearTimeout(hideTimer);
+    };
+  }, [duration, onDismiss]);
 
   const handleStartNow = () => {
     setIsFading(true);

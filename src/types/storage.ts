@@ -9,7 +9,9 @@ export type UploadFolder =
   | 'chats'
   | 'audio'
   | 'events'
-  | 'rooms';
+  | 'rooms'
+  | 'stickers'
+  | 'live';
 
 export type MediaKind = 'image' | 'video' | 'audio';
 
